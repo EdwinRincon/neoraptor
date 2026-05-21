@@ -1,0 +1,6 @@
+# Claude Code / LeanCTX local data
+.claude/settings.local.json
+.claude/memory/
+.claude/sessions/
+.claude/cache/
+.lean-ctx/
