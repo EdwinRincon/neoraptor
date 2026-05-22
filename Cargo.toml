@@ -1,0 +1,48 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/api",
+    "crates/agents-core",
+    "crates/agents-impl",
+    "crates/ports",
+    "crates/providers",
+    "crates/memory",
+    "crates/tools",
+    "crates/db",
+    "crates/config",
+]
+
+[workspace.package]
+edition = "2021"
+version = "0.1.0"
+rust-version = "1.95"
+license = "Apache-2.0"
+
+[workspace.dependencies]
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
+futures = "0.3"
+uuid = { version = "1", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+sqlx = { version = "0.8", default-features = false, features = [
+    "runtime-tokio-rustls",
+    "postgres",
+    "macros",
+    "uuid",
+    "chrono",
+    "json",
+] }
+
+[workspace.lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+large_enum_variant = "deny"
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+missing_docs = "warn"

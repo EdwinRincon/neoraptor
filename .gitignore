@@ -30,6 +30,7 @@ $RECYCLE.BIN/
 # --- Editors / IDEs (personal settings) ---
 # VS Code (keep only shared config if you want)
 .vscode/
+.github/
 # Or, if you want to share team settings:
 # .vscode/*
 # !.vscode/settings.json
@@ -47,3 +48,10 @@ $RECYCLE.BIN/
 \#*#
 *.un~
 .sublime-workspace
+
+# Added by cargo
+
+/target
+
+# others
+useful_commands.txt
