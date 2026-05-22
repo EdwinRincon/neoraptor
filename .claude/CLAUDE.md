@@ -1,169 +1,139 @@
-# CLAUDE.md — NEORAPTOR Development Guide
+# CLAUDE.md — NEORAPTOR
 
-See @README.md for project overview and system architecture.  
-See @WORK_PLAN.md for v0.1.0 acceptance criteria.
+Use this file as your always‑loaded map of the repo.  
+For details, follow the links instead of inlining long explanations.
 
-## How to use Claude in this repo
+## What this project is
 
-- Prefer high-level goals: “implement ScopeContract in agents-core and wire it into Intent validation” rather than line edits.
-- When in doubt, explore first: use **plan mode** to read code and propose a plan before editing.
-- Always propose a test plan when changing agents, tools, or sandbox code.
+- NEORAPTOR is a Rust monorepo for security‑focused agents, tools, and an event‑sourced memory layer.
+- Core crates:
+  - `agents-core/`: messages, typestate, authorization contracts
+  - `agents-impl/`: concrete agents/actors
+  - `ports/`: abstract traits (ports)
+  - `providers/`: external adapters implementing ports
+  - `tools/`, `memory/`, `db/`, `api/`: tools, event log, persistence, HTTP API
+- Start with:
+  - Project overview and architecture: `@README.md`
+  - v0.1.0 scope: `@WORK_PLAN.md`
+  - Threat model: `docs/threat-model.md`
+  - ADRs (design decisions): `docs/adr/` (esp. `ADR-001` for async traits)
 
-## Code Style & Patterns
+## Why it exists / key constraints
 
-- Use **typestate pattern** for security invariants:  
-  `Intent → ScopeContract::authorize() → ValidatedIntent → ValidatedCommand`
-- Use **Arc<dyn Trait>** (not Box) for provider dispatch; all traits in `ports/` use `#[trait_variant::make(TraitName: Send)]`.
-- **Never** use `async_trait` macro; it is banned in `deny.toml`. Use `trait-variant` instead.
-- Use **phantom types** for protocol-specific specs: `ProbeSpec<P: ProbeProtocol>` — see `crates/tools/src/probe.rs` for examples.
-- Use **builder patterns** for complex types (Intent, ProbeSpec, ScopeContract); builders are unvalidated, final types are compile-time checked.
-- Secrets as `secrecy::Secret<T>` at config boundaries; `expose_secret()` only in DB connect and whitelisted provider code; no logging of secrets.
+- Strict security boundaries:
+  - Ports vs providers split
+  - Typestate for authorization: you must go through `ScopeContract` to reach a `ValidatedIntent` and `ValidatedCommand`.
+- Everything that matters for audit or behavior is **structured**, not opaque JSON:
+  - Event log via `memory/EventBus`
+  - First‑class audit columns (e.g. `approved_by`, `approved_at`, `reason`)
+- Database and sandbox usage must leave a clear, queryable trail:
+  - All sandbox invocations log `(ValidatedCommand, ArtifactId)` in the event log.
 
-## Workspace Rules (Non-Negotiable)
+See the threat model and ADRs for rationale before widening any security surface.
 
-- **Crate boundaries**: `api/` is the only crate that imports `providers/`; all others depend on abstract `ports/` traits only.
-- **Never** import `config/` into `ports/` — config shapes are never part of port contracts.
-- **Never** make `ValidatedCommand` `Clone` — it should be consumed once and only once.
-- **ScopeContract::authorize() is the ONLY legal way to construct `ValidatedIntent`.**  
-  Do not add any other constructor, helper, or test-only backdoor.
-- Workspace lints enforced via `.cargo/config.toml`: ban `unwrap`, `expect`, `panic` in production crates (ok in `api/` only).
-- `deny.toml` bans `anyhow`, `async-trait` everywhere except `api/`.
+## How to work in this repo
 
-## Inline Examples
+### Mental model and workflow
 
-### Intent → ScopeContract → ValidatedIntent Pipeline
+- Before coding:
+  - Restate the task in 2–3 sentences and say what “done” looks like and how you’ll verify it (tests, clippy, sqlx, logs).
+  - If intent is ambiguous, list the two most likely interpretations and ask which is correct.
+- Plan‑first:
+  - Explore relevant files, then propose a short plan.
+  - Wait for confirmation before large or cross‑crate changes.
+- Make **surgical** edits:
+  - Touch only the necessary files and symbols.
+  - Do not change `ports/` APIs, agent message shapes, or typestate semantics unless explicitly asked.
 
-```rust
-// Intent is unvalidated user input
-pub struct Intent(pub String);
+### Commands you should know
 
-// ScopeContract is the ONLY gate
-pub struct ValidatedIntent(String);
+Prefer these instead of inventing commands:
 
-impl Intent {
-    pub fn validate(self, contract: &ScopeContract) -> Result<ValidatedIntent, PolicyError> {
-        contract.authorize_intent(&self)?;
-        Ok(ValidatedIntent(self.0))
-    }
-}
-```
+- Local dev: `just dev` (requires Docker + Postgres)
+- Lint: `just lint` (fmt + clippy + deny checks)
+- Tests: `cargo test` or `just test`
+- SQLx offline prep: `just prepare-sqlx`
 
-### ProbeSpec<P> Builder Pattern
+If any command fails, explain the error, propose a fix, and then rerun.
 
-```rust
-// Builders are unvalidated; full struct is type-checked
-pub struct ProbeSpecBuilder { /* fields */ }
+### Code style and patterns (universal rules)
 
-impl ProbeSpecBuilder {
-    pub fn build(self) -> Result<ProbeSpec<HttpProbe>, ValidationError> {
-        self.validate_required_fields()?;
-        Ok(ProbeSpec { /* ... */ })
-    }
-}
-```
+These apply to **all** tasks that touch Rust code here:
 
-For full pattern examples, see:
+- Typestate for security:
+  - Pipeline: `Intent → ScopeContract::authorize() → ValidatedIntent → ValidatedCommand`
+  - `ScopeContract::authorize()` is the **only** legal way to construct `ValidatedIntent` (no helpers or test‑only backdoors).
+- Traits and async:
+  - Use `Arc<dyn Trait>` (not `Box`) for provider dispatch.
+  - Traits in `ports/` use `#[trait_variant::make(TraitName: Send)]` so they can cross `tokio::spawn` boundaries.
+  - Do **not** use `async_trait`; `deny.toml` bans it (except in `api/` where allowed by ADR‑001).
+- Builders and phantom types:
+  - Use builder pattern for complex types (e.g. `Intent`, `ProbeSpec`, `ScopeContract`): builders are unvalidated; final types are compile‑time checked.
+  - `ProbeSpec<P>` uses `PhantomData<P>` to enforce protocol at compile time; do not remove it.
+- Secrets:
+  - Use `secrecy::Secret<T>` at config boundaries.
+  - Call `expose_secret()` only in DB connect code and explicitly whitelisted providers.
+  - Never log secrets.
+
+For concrete examples, see:
 
 - `crates/tools/src/probe.rs`
 - `crates/agents/agents-core/src/intent.rs`
 - `crates/config/src/scope_contract.rs`
 
-## Security & Event Log Discipline
+## Workspace rules (non‑negotiable)
 
-- **Never** emit opaque JSON blobs to Postgres; new features must record structured events via `memory/EventBus`.
-- Audit fields (`approved_by`, `approved_at`, `reason`) are first-class typed columns, not JSON blobs.
-- Authorization is re-evaluated on every SSE cursor resume, not cached.
-- All sandbox invocations must record `ValidatedCommand` + `ArtifactId` in the event log for audit trail.
+- Crate boundaries:
+  - `api/` is the **only** crate that imports `providers/`.
+  - Other crates depend only on traits in `ports/`.
+- Config:
+  - Never import `config/` into `ports/`; config shapes are not part of port contracts.
+- Typestate:
+  - `ValidatedCommand` must **not** be `Clone`; it is consumed exactly once.
+- Lints and dependencies:
+  - Do not work around workspace lints; if clippy/deny rejects something, fix the code instead of relaxing rules.
+  - `deny.toml` bans `anyhow` and `async-trait` in non‑`api/` crates.
 
-## Testing & Verification
+If a change appears to require breaking any of the above, stop and ask for an explicit architecture decision.
 
-**Before any change is "done":**
+## Testing and “done”
 
-- `cargo clippy` must pass (workspace-wide lints enforced).
-- `cargo test` must pass (all unit + integration tests).
-- `just prepare-sqlx` to commit `.sqlx/` changes (offline mode validation).
-- If touching `ports/`, ensure `#[trait_variant::make(TraitName: Send)]` is present.
-- If touching `db/`, verify migrations compile and run in test.
-- If touching `agents-impl/`, check that agent messages use tagged enums (no large enum variants).
+For any change that touches code (agents, tools, memory, db, API):
 
-Run `just lint` before PR; it runs fmt, clippy, and deny checks.
+- Define up front how you will verify it (which tests, which commands, which logs).
+- Before you consider a task done:
+  - `cargo clippy` passes for the workspace.
+  - `cargo test` passes (unit + integration).
+  - If DB is involved: migrations compile and pass in tests; `just prepare-sqlx` has been run and `.sqlx/` updates are committed.
+- When touching:
+  - `ports/`: ensure `#[trait_variant::make(TraitName: Send)]` is present for new traits.
+  - `agents-impl/`: favor tagged enums and avoid very large enum variants.
 
-## Common Gotchas
+In your responses, always include a short test plan (what to run, expected outcome).
 
-- **Phantom types**: `ProbeSpec<P>` uses `PhantomData<P>` to enforce protocol at compile time; don't omit it.
-- **Send bounds**: If adding a new trait to `ports/`, always use `#[trait_variant::make(TraitName: Send)]` — without it, the trait cannot cross `tokio::spawn` boundaries.
-- **YAML runtime mismatches**: Nuclei templates are interpreted at runtime; NEORAPTOR ProbeSpecs are compile-time typed — this prevents silent mismatches.
-- **Event log ordering**: Events are append-only by monotonic ID; never assume ordering, always query with cursor-based pagination.
-- **Context window**: CLAUDE.md can get stale if context fills up — see "Context Hygiene Rules" below.
+## Context and interaction rules
 
-## Development Workflow
+- Keep sessions focused:
+  - Use `/clear` when switching to a different task or domain.
+  - If there have been many corrections, suggest `/clear`, then restate the current task in your own words.
+- Use concise, “smart caveman mode” replies only for:
+  - Tool calls, file operations, and yes/no confirmations.
+- Use full prose for:
+  - Architecture, design, threat‑model questions
+  - Explaining errors, debugging, and tradeoffs
 
-- **Local dev**: `just dev` starts all services (requires Docker, Postgres).
-- **Check before PR**: `just lint && just test`.
-- **Database migrations**: Use `sqlx-cli` and test migrations with integration tests; document any schema-breaking changes in `docs/adr/ADR-*`.
-- **New agents**: Add to `crates/agents/agents-impl/src/actors/`; register in `agents-impl/src/lib.rs`; new messages in `agents-core/src/messages.rs`.
-- **New ports**: Define trait in `crates/ports/src/`; implement in `crates/providers/src/adapters/`; wire in `api/src/bootstrap.rs`.
+## Where to read more (progressive disclosure)
 
-## Execution Discipline (Claude in this repo)
+This root file stays short on purpose.
 
-These rules apply to ALL changes in this project, especially under
-`agents-core/`, `agents-impl/`, `tools/`, `memory/`, and `db/`.
+When you need more detail, go to:
 
-**1. Think before acting.**
+- Overall architecture and layout: `@README.md`
+- Roadmap and v0.1.0 acceptance criteria: `@WORK_PLAN.md`
+- Threat model and security boundaries: `docs/threat-model.md`
+- Async traits and typestate decisions: `docs/adr/ADR-001.md`
+- Other design decisions: `docs/adr/ADR-*.md`
+- Agents‑specific details: `crates/agents/CLAUDE.md` (if present)
+- DB/migrations specifics: `db/CLAUDE.md` (if present)
 
-- Before changing code, restate your interpretation of the request in
-  2–3 sentences.
-- If the intent is ambiguous, list the two most likely interpretations
-  and ask which is correct before editing.
-
-**2. Minimum viable response.**
-
-- Do exactly what was asked — nothing more.
-- Do NOT add unrequested refactors, new features, or “while we’re here”
-  improvements to typestate, agents, ports, or sandbox code.
-- If you see a real issue outside the scope, call it out and propose a
-  separate task instead of changing it.
-
-**3. Surgical changes only.**
-
-- Touch only the files and symbols required for the task.
-- Do NOT drive cross-crate refactors (e.g., changing `ports/` APIs or
-  `agents-core` message shapes) unless explicitly requested.
-- Never widen `ScopeContract`, `ValidatedIntent`, or `ValidatedCommand`
-  semantics without an explicit architecture request.
-
-**4. Define success before starting.**
-
-- For multi-step tasks, briefly state what “done” looks like before you
-  start editing (2–3 sentences is enough).
-- Include how success will be verified (tests, clippy, sqlx, or specific
-  log / event checks).
-  
-## Context Hygiene Rules
-
-- Use `/clear` between unrelated tasks (e.g., switching from API work to agent work).
-- For deep exploration of the codebase, use **subagents** — they explore in a separate context and report findings back without cluttering the main session.
-- If you (Claude) notice a long session with many corrections, suggest `/clear` and restate the current task in your own words before continuing.
-- If correcting Claude more than twice on the same issue, run `/clear` and rephrase the prompt with what you learned — stale context pollutes reasoning.
-- CLAUDE.md is stable; if you find yourself repeating instructions, they belong in CLAUDE.md.
-
-## Caveman Mode
-
-Use terse, caveman-style responses for:
-
-- Tool calls
-- File operations
-- Yes/No confirmations
-
-Use full prose for:
-
-- Architecture, design, and threat-model questions
-- Error explanations and debugging narratives
-
-## References
-
-- **Architecture**: @README.md (workspace layout, typestate, ports/providers split).
-- **Product roadmap**: @WORK_PLAN.md (v0.1.0 acceptance criteria, phased delivery).
-- **Threat model**: `docs/threat-model.md` (security boundary, isolation requirements).
-- **ADRs**: `docs/adr/` (ADR-001: async trait strategy, ADR-002+: in progress).
-- **Async traits (non-negotiable)**: See ADR-001 at `docs/adr/ADR-001.md` or README.md §5 for full rationale.
+If a detailed CLAUDE file for a sub‑area is missing, propose creating it instead of bloating this root file.
