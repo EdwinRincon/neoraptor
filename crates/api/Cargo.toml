@@ -6,6 +6,30 @@ rust-version.workspace = true
 license = "Apache-2.0"
 
 [dependencies]
+# Web framework
+axum = "0.7"
+tower = "0.5"
+tower-http = { version = "0.6", features = ["trace"] }
+
+# Workspace dependencies
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+bytes = { workspace = true }
+
+# Error handling (allowed in api crate per deny.toml)
+anyhow = "1"
+thiserror = { workspace = true }
+secrecy = { version = "0.8", features = ["serde"] }
+
+# Local crates
+db = { path = "../db" }
+ports = { path = "../ports" }
+config = { path = "../config" }
 
 [lints]
 workspace = true

@@ -91,6 +91,11 @@ ignore = [
 allow = [
     "MIT",
     "Apache-2.0",
+    "ISC",
+    "Unicode-3.0",
+    "Zlib",
+    "CDLA-Permissive-2.0",
+    "BSD-3-Clause",
     #"Apache-2.0 WITH LLVM-exception",
 ]
 # The confidence threshold for detecting a license from license text.
@@ -170,8 +175,11 @@ allow = [
 allow-workspace = false
 # List of crates to deny
 deny = [
-    # async-trait is banned workspace-wide except in api/ and providers/; use trait_variant::make instead (ADR-001)
-    { name = "async-trait", wrappers = ["api", "providers"], reason = "Use trait_variant::make for Send-bound async traits" },
+    # async-trait is banned in workspace crates; use trait_variant::make in ports (ADR-001).
+    # Allowed in providers/ where async-trait is explicitly justified.
+    # External crates (axum, axum-core) may use async-trait internally; this is acceptable
+    # since we control only our workspace crates, not third-party dependencies.
+    { name = "async-trait", wrappers = ["providers", "axum", "axum-core"], reason = "Use trait_variant::make in ports; async-trait only in providers or external deps" },
     # anyhow is banned except in api/ crate; use thiserror in libraries
     { name = "anyhow", wrappers = ["api"], reason = "Library crates must use typed errors (thiserror)" },
 ]
