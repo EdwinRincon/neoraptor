@@ -6,8 +6,13 @@ CREATE TABLE IF NOT EXISTS artifacts (
     id UUID PRIMARY KEY,
     content_type TEXT NOT NULL,
     data BYTEA NOT NULL,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+
+    -- Optional metadata (aligned with schema.dbml)
+    kind TEXT,          -- "file", "report", "log", ...
+    filename TEXT,
+    size_bytes BIGINT
 );
 
--- Index for retrieval by ID (primary key already covers this, but explicit for clarity).
-CREATE INDEX idx_artifacts_id ON artifacts(id);
+-- Primary key already indexes id; this is kept explicit for clarity.
+CREATE INDEX IF NOT EXISTS idx_artifacts_id ON artifacts(id);

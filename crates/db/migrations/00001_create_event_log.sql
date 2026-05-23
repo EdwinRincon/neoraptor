@@ -11,4 +11,7 @@ CREATE TABLE IF NOT EXISTS event_log (
 );
 
 -- Index for reading from a cursor (typical event replay pattern).
-CREATE INDEX idx_event_log_id ON event_log(id);
+CREATE INDEX IF NOT EXISTS idx_event_log_id ON event_log(id);
+
+-- Index for time-range queries (monitoring, dashboards, retention ops).
+CREATE INDEX IF NOT EXISTS idx_event_log_timestamp ON event_log(timestamp DESC);

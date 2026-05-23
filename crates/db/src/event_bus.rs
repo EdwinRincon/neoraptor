@@ -59,7 +59,7 @@ impl EventBus for PostgresEventBus {
             r#"
             SELECT id, timestamp, payload_type, payload
             FROM event_log
-            WHERE id >= $1
+            WHERE id > $1
             ORDER BY id ASC
             "#,
         )

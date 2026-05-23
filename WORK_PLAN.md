@@ -39,6 +39,7 @@ Keep the existing workspace architecture and rules; they are already production�
 
 - Crates: `api`, `agents-core`, `agents-impl`, `ports`, `providers`, `memory`, `tools`, `db`, `config`.
 - Rules: only `api` and binaries import `providers`; everyone else depends on `ports`. `ports` never imports `config`.
+- Database schema is documented in `crates/db/schema.dbml` and materialized via SQL migrations in `crates/db/migrations/`. `schema.dbml` is the architectural source of truth; migrations stay small and incremental.
 
 **New explicit v0.1.0 “vertical slice” definition**
 
@@ -64,6 +65,8 @@ The CI config is solid; we only clarify phase boundaries.
 - **CI (v0.1)**:
   - Lint (fmt, clippy, `cargo-deny`) → Test (Rust + Postgres service, `just prepare-sqlx`) → Frontend checks → Docker build.
   - Security lints: `expose_secret` grep, `instrument(skip(..))` enforcement, workspace `deny` for `unwrap`, `expect`, `panic`, `async-trait`, `anyhow` except `api`.
+
+  - Keep `crates/db/schema.dbml` and `crates/db/migrations/` in sync when adding or changing tables.
 
 - **CD (v0.1)**:
   - Manual: `docker compose pull && docker compose up -d` on a single node.
@@ -186,6 +189,13 @@ Focus on ports/config that are needed for the MVP slice.
 3. Add basic API endpoints for creating test runs and appending events (internal, for testing).
 
 **DoD**: You can create a fake run via API, persist events and artifacts, and list them back via HTTP.
+
+### Week 3 - Synced with the current state of git project, as of 2024-06-23
+- Implemented db crate infrastructure:
+  - Postgres-backed EventBus (event_log table, cursor-based append/read).
+  - Postgres-backed ArtifactStore (artifacts table, UUID ids, BYTEA payloads).
+  - DbPool newtype and connect_database using DatabaseConfig + secrecy::Secret.
+  - Migrations 00001_create_event_log.sql and 00002_create_artifacts.sql added and passing CI.
 
 ***
 

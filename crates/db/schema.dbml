@@ -1,0 +1,257 @@
+Project Neoraptor {
+  database_type: "PostgreSQL"
+}
+
+/*************************************************
+ * Enumerated types (modeled as enums/checks)
+ *************************************************/
+
+// In PostgreSQL migrations, these would be CREATE TYPE ... AS ENUM.
+// Here we document them as enums for clarity.
+
+Enum flow_status {
+  pending
+  running
+  completed
+  failed
+}
+
+Enum task_status {
+  pending
+  running
+  done
+  failed
+}
+
+Enum subtask_status {
+  queued
+  running
+  completed
+  failed
+}
+
+Enum action_status {
+  success
+  failure
+}
+
+Enum finding_status {
+  pending
+  confirmed
+  disputed
+}
+
+Enum severity_level {
+  low
+  medium
+  high
+  critical
+}
+
+/*************************************************
+ * Core run / flow hierarchy
+ *************************************************/
+
+Table flow_runs {
+  id              uuid [pk, default: `gen_random_uuid()`]
+  name            text [not null]
+  description     text
+  status          flow_status [not null, default: 'pending']
+  goal            text [not null]
+  scope_id        uuid [not null, ref: > scope_contracts.id]
+  created_at      timestamptz [not null, default: `now()`]
+  updated_at      timestamptz [not null, default: `now()`]
+  deleted_at      timestamptz // soft-delete, null = active
+
+  created_by      text [not null]   // operator id/username
+  approved_by     text
+  approved_at     timestamptz
+  approved_from   text             // ip / workstation id
+  approval_reason text
+
+  Note: flow_runs is the top-level pentest run.
+}
+
+Table tasks {
+  id              uuid [pk, default: `gen_random_uuid()`]
+  flow_id         uuid [not null, ref: > flow_runs.id]
+  name            text [not null]
+  description     text
+  status          task_status [not null, default: 'pending']
+  result_summary  jsonb
+  created_at      timestamptz [not null, default: `now()`]
+  updated_at      timestamptz [not null, default: `now()`]
+
+  assigned_actor  text // e.g. "Orchestrator", "Executor"
+}
+
+Table subtasks {
+  id              uuid [pk, default: `gen_random_uuid()`]
+  task_id         uuid [not null, ref: > tasks.id]
+  name            text [not null]
+  description     text
+  status          subtask_status [not null, default: 'queued']
+  agent_type      text [not null]  // "researcher", "developer", "executor", ...
+  context         jsonb
+  created_at      timestamptz [not null, default: `now()`]
+  updated_at      timestamptz [not null, default: `now()`]
+}
+
+Table actions {
+  id              uuid [pk, default: `gen_random_uuid()`]
+  subtask_id      uuid [not null, ref: > subtasks.id]
+  action_type     text [not null]  // "command", "search", "analyze", "tool", ...
+  status          action_status [not null]
+  parameters      jsonb            // structured parameters
+  result_summary  jsonb
+  sandbox_profile text             // profile id used in SandboxRuntime
+  created_at      timestamptz [not null, default: `now()`]
+}
+
+/*************************************************
+ * Artifacts & memory
+ *************************************************/
+
+Table artifacts {
+  id            uuid [pk, default: `gen_random_uuid()`]
+  action_id     uuid [not null, ref: > actions.id]
+  content_type  text [not null]
+  data          bytea [not null]
+  created_at    timestamptz [not null, default: `now()`]
+
+  kind          text      // "file", "report", "log", ...
+  filename      text
+  size_bytes    bigint
+
+  Note: small/medium artifacts in-DB v0.1; consider offloading large blobs post-v0.1.
+}
+
+Table memories {
+  id            uuid [pk, default: `gen_random_uuid()`]
+  action_id     uuid [not null, ref: > actions.id]
+  kind          text [not null]    // "observation", "conclusion", ...
+  embedding     vector             // pgvector, optional extension
+  content       text [not null]
+  created_at    timestamptz [not null, default: `now()`]
+}
+
+/*************************************************
+ * Event log
+ *************************************************/
+
+Table event_log {
+  id            bigserial [pk]
+  timestamp     timestamptz [not null, default: `now()`]
+  payload_type  text [not null]
+  payload       bytea [not null]
+
+  Indexes {
+    (id) [name: "idx_event_log_id"]
+    (timestamp) [name: "idx_event_log_timestamp"]
+  }
+
+  Note: append-only; candidate for time partitioning post-v0.1.
+}
+
+/*************************************************
+ * Findings & chains
+ *************************************************/
+
+Table findings {
+  id              uuid [pk, default: `gen_random_uuid()`]
+  flow_id         uuid [not null, ref: > flow_runs.id]
+  action_id       uuid [ref: > actions.id] // may be null for synthesized findings
+  severity        severity_level [not null]
+  status          finding_status [not null, default: 'pending']
+  title           text [not null]
+  description     text [not null]
+  evidence        jsonb  // references to artifacts, logs, etc.
+  created_at      timestamptz [not null, default: `now()`]
+  updated_at      timestamptz [not null, default: `now()`]
+
+  validated_by    text
+  validated_at    timestamptz
+}
+
+Table chain_hypotheses {
+  id              uuid [pk, default: `gen_random_uuid()`]
+  flow_id         uuid [not null, ref: > flow_runs.id]
+  title           text [not null]
+  description     text
+  status          text [not null] // "candidate","planned","executed","abandoned"
+  created_at      timestamptz [not null, default: `now()`]
+  updated_at      timestamptz [not null, default: `now()`]
+}
+
+Table chain_hypothesis_findings {
+  id              uuid [pk, default: `gen_random_uuid()`]
+  chain_id        uuid [not null, ref: > chain_hypotheses.id]
+  finding_id      uuid [not null, ref: > findings.id]
+  created_at      timestamptz [not null, default: `now()`]
+
+  Indexes {
+    (chain_id, finding_id) [unique, name: "uniq_chain_finding"]
+  }
+
+  Note: junction table for many-to-many between hypotheses and findings.
+}
+
+/*************************************************
+ * Scope & governance
+ *************************************************/
+
+Table scope_contracts {
+  id                uuid [pk, default: `gen_random_uuid()`]
+  authorization_id  uuid [not null] // matches ScopeContract.authorization_id
+  name              text [not null]
+  allowed_targets   jsonb [not null]
+  excluded_paths    jsonb
+  requires_approval_above text [not null] // risk threshold
+  valid_until       timestamptz
+  created_at        timestamptz [not null, default: `now()`]
+}
+
+/*************************************************
+ * Coverage & metrics
+ *************************************************/
+
+Table coverage_map {
+  id                uuid [pk, default: `gen_random_uuid()`]
+  flow_id           uuid [not null, ref: > flow_runs.id]
+  target_component  text [not null]
+  attack_class      text [not null]
+  status            text [not null] // "none","partial","covered"
+  last_updated_at   timestamptz [not null, default: `now()`]
+
+  Indexes {
+    (flow_id, target_component, attack_class) [name: "idx_coverage_flow_target_attack"]
+  }
+}
+
+/*************************************************
+ * Additional indexes for common query paths
+ *************************************************/
+
+Table flow_runs {
+  Indexes {
+    (status, created_at) [name: "idx_flow_runs_status_created_at"]
+  }
+}
+
+Table tasks {
+  Indexes {
+    (flow_id, status) [name: "idx_tasks_flow_status"]
+  }
+}
+
+Table actions {
+  Indexes {
+    (subtask_id, action_type) [name: "idx_actions_subtask_type"]
+  }
+}
+
+Table findings {
+  Indexes {
+    (flow_id, severity) [name: "idx_findings_flow_severity"]
+  }
+}
