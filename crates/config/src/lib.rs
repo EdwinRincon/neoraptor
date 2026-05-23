@@ -1,16 +1,7 @@
-#![allow(missing_docs)]
+//! Typed configuration with secret management.
+//!
+//! All secrets are wrapped in `secrecy::Secret<T>` at deserialization boundaries.
 
-pub fn add(left: u64, right: u64) -> u64 {
-    left + right
-}
+pub mod llm;
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn it_works() {
-        let result = add(2, 2);
-        assert_eq!(result, 4);
-    }
-}
+pub use llm::{LlmConfig, LlmModelConfig, LlmProviderKind};

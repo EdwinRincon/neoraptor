@@ -1,16 +1,7 @@
-#![allow(missing_docs)]
+//! Concrete provider implementations.
+//!
+//! This crate is imported only by `api/` and executable entrypoints.
 
-pub fn add(left: u64, right: u64) -> u64 {
-    left + right
-}
+pub mod openai;
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn it_works() {
-        let result = add(2, 2);
-        assert_eq!(result, 4);
-    }
-}
+pub use openai::OpenAiAdapter;

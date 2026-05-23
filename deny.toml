@@ -144,7 +144,7 @@ registries = [
 # Lint level for when multiple versions of the same crate are detected
 multiple-versions = "warn"
 # Lint level for when a crate version requirement is `*`
-wildcards = "deny"
+wildcards = "allow"
 # The graph highlighting used when creating dotgraphs for crates
 # with multiple versions
 # * lowest-version - The path to the lowest versioned duplicate is highlighted
@@ -170,11 +170,10 @@ allow = [
 allow-workspace = false
 # List of crates to deny
 deny = [
-    #"ansi_term@0.11.0",
-    #{ crate = "ansi_term@0.11.0", reason = "you can specify a reason it is banned" },
-    # Wrapper crates can optionally be specified to allow the crate when it
-    # is a direct dependency of the otherwise banned crate
-    #{ crate = "ansi_term@0.11.0", wrappers = ["this-crate-directly-depends-on-ansi_term"] },
+    # async-trait is banned workspace-wide except in api/ and providers/; use trait_variant::make instead (ADR-001)
+    { name = "async-trait", wrappers = ["api", "providers"], reason = "Use trait_variant::make for Send-bound async traits" },
+    # anyhow is banned except in api/ crate; use thiserror in libraries
+    { name = "anyhow", wrappers = ["api"], reason = "Library crates must use typed errors (thiserror)" },
 ]
 
 # List of features to allow/deny

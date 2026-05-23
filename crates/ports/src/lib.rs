@@ -1,16 +1,8 @@
-#![allow(missing_docs)]
+//! Abstract port traits for pluggable external integrations.
+//!
+//! All traits use `#[trait_variant::make(TraitName: Send)]` to produce
+//! Send-bound variants safe for `Arc<dyn Trait>` dispatch across `tokio::spawn`.
 
-pub fn add(left: u64, right: u64) -> u64 {
-    left + right
-}
+pub mod llm;
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn it_works() {
-        let result = add(2, 2);
-        assert_eq!(result, 4);
-    }
-}
+pub use llm::{CompletionRequest, CompletionResponse, LlmError, LlmProvider};
