@@ -5,6 +5,10 @@ version = 4
 [[package]]
 name = "agents-core"
 version = "0.1.0"
+dependencies = [
+ "serde",
+ "thiserror",
+]
 
 [[package]]
 name = "agents-impl"
