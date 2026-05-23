@@ -6,6 +6,16 @@ rust-version.workspace = true
 license = "Apache-2.0"
 
 [dependencies]
+ports = { path = "../ports" }
+config = { path = "../config" }
+sqlx = { workspace = true }
+uuid = { workspace = true }
+bytes = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+secrecy = { version = "0.8", features = ["serde"] }
+chrono = { workspace = true }
 
 [lints]
 workspace = true
