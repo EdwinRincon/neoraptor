@@ -9,7 +9,7 @@ use crate::AppState;
 /// Create the artifacts router.
 pub fn router() -> Router<AppState> {
     Router::new().route(
-        "/internal/actions/:action_id/artifacts",
+        "/internal/actions/{action_id}/artifacts",
         get(list_artifacts),
     )
 }

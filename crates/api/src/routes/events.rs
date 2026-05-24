@@ -24,8 +24,8 @@ use crate::{
 /// Create the events router.
 pub fn router() -> Router<AppState> {
     Router::new()
-        .route("/internal/runs/:run_id/events", post(append_event))
-        .route("/internal/runs/:run_id/events", get(list_events))
+        .route("/internal/runs/{run_id}/events", post(append_event))
+        .route("/internal/runs/{run_id}/events", get(list_events))
 }
 
 /// POST /internal/runs/:run_id/events - Append an event to a run.
