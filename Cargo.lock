@@ -6,13 +6,26 @@ version = 4
 name = "agents-core"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "serde",
  "thiserror",
+ "uuid",
 ]
 
 [[package]]
 name = "agents-impl"
 version = "0.1.0"
+dependencies = [
+ "agents-core",
+ "bytes",
+ "ports",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "uuid",
+]
 
 [[package]]
 name = "aho-corasick"
@@ -48,6 +61,8 @@ checksum = "7f202df86484c868dbad7eaa557ef785d5c66295e41b460ef922eca0723b842c"
 name = "api"
 version = "0.1.0"
 dependencies = [
+ "agents-core",
+ "agents-impl",
  "anyhow",
  "axum",
  "bytes",
@@ -60,6 +75,7 @@ dependencies = [
  "serde_json",
  "thiserror",
  "tokio",
+ "tokio-util",
  "tower",
  "tower-http",
  "tracing",

@@ -14,6 +14,17 @@ pub enum ValidationError {
     /// The intent contains invalid or malformed data.
     #[error("invalid intent: {0}")]
     InvalidIntent(String),
+
+    /// Target is not allowed by the authorization scope.
+    #[error("target '{target}' is not in scope")]
+    TargetNotInScope {
+        /// The target that was rejected.
+        target: String,
+    },
+
+    /// Authorization scope has expired.
+    #[error("scope expired")]
+    ScopeExpired,
 }
 
 /// Errors that can occur during policy enforcement.

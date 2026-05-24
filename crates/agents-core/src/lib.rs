@@ -1,43 +1,43 @@
 //! Core agent types and typestate pipeline.
 //!
-//! This crate defines the fundamental types for NEORAPTOR's agent system,
-//! including the security-enforced typestate pipeline and supervision contracts.
-//!
-//! # Typestate Pipeline
-//!
-//! The typestate pipeline enforces security invariants at compile time:
+//! This crate defines the security-enforced typestate pipeline for agent intents:
 //!
 //! ```text
 //! Intent → ValidatedIntent → ExecutionPlan → ValidatedCommand
 //! ```
 //!
-//! - `Intent`: Unvalidated request from LLM or operator
-//! - `ValidatedIntent`: Passed validation (only via `Intent::validate()`)
-//! - `ExecutionPlan`: Concrete steps to fulfill the intent
-//! - `ValidatedCommand`: Ready for sandbox execution (not `Clone`, consumed once)
-//!
-//! # Security Invariants
-//!
-//! - `ValidatedIntent` can ONLY be constructed via `Intent::validate()`
-//! - `ValidatedCommand` does NOT implement `Clone` (consumed exactly once)
-//! - In the full pipeline, `ScopeContract::authorize()` will compose with validation
+//! The pipeline enforces that:
+//! - No intent can become validated without passing scope checks
+//! - No command can be executed without being validated
+//! - Authorization boundaries are compile-time enforced via typestate
 //!
 //! # Example
 //!
 //! ```
-//! use agents_core::intent::Intent;
+//! use agents_core::{Intent, ScopeContract};
+//! use uuid::Uuid;
 //!
+//! // Define an authorization scope
+//! let scope = ScopeContract::builder()
+//!     .allow_target("192.168.1.1")
+//!     .authorization_id(Uuid::new_v4())
+//!     .build()
+//!     .expect("valid scope");
+//!
+//! // Create and validate an intent
 //! let intent = Intent::builder()
-//!     .description("Scan target for open ports")
+//!     .description("Quick TCP scan")
 //!     .target("192.168.1.1")
 //!     .build();
 //!
-//! let validated = intent.validate().expect("validation failed");
+//! let validated = intent.validate(&scope).expect("validation failed");
 //! let mut plan = validated.into_plan();
+//!
+//! // Add execution steps (Week 5: will be handled by PentestTool)
 //! plan.add_step("nmap -sV 192.168.1.1");
 //!
 //! let command = plan.into_command();
-//! // Command is now ready for sandbox execution
+//! // command is now ready for sandbox execution
 //! ```
 
 #![warn(missing_docs)]
@@ -46,6 +46,7 @@
 pub mod error;
 pub mod intent;
 pub mod message;
+pub mod scope;
 pub mod supervision;
 pub mod validated;
 
@@ -53,5 +54,6 @@ pub mod validated;
 pub use error::{PolicyError, ValidationError};
 pub use intent::{Intent, IntentBuilder};
 pub use message::AgentMessage;
+pub use scope::{ScopeContract, ScopeContractBuilder, ScopeContractError};
 pub use supervision::{BackoffSchedule, ExecutionLimits, RestartStrategy, SupervisorPolicy};
 pub use validated::{ExecutionPlan, ValidatedCommand, ValidatedIntent};

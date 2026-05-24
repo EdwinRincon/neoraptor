@@ -1,16 +1,7 @@
-#![allow(missing_docs)]
+//! Agent implementations for NEORAPTOR.
 
-pub fn add(left: u64, right: u64) -> u64 {
-    left + right
-}
+pub mod executor;
+pub mod orchestrator;
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn it_works() {
-        let result = add(2, 2);
-        assert_eq!(result, 4);
-    }
-}
+pub use executor::{ExecutorActor, ExecutorMessage};
+pub use orchestrator::{OrchestratorActor, OrchestratorMessage};

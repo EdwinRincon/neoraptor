@@ -205,6 +205,8 @@ Focus on ports/config that are needed for the MVP slice.
 2. Implement minimal `agents-impl`: `OrchestratorActor`, `ExecutorActor` only (Researcher/Developer/Mentor can be rough skeletons or stubbed).
 3. Implement `RootSupervisor` in `api/src/bootstrap.rs` with restart/backoff semantics.
 
+- Wire the existing `ScopeContract` types from `agents-core` into `Intent` validation, so `ScopeContract::authorize` is the only legal entry point for `Intent::validate` as described in the README.md
+
 **DoD**: A simple run can be driven by Orchestrator + Executor using a stubbed tool against sandbox, with events recorded to the event log.
 
 ***
@@ -213,7 +215,8 @@ Focus on ports/config that are needed for the MVP slice.
 
 1. Implement `SandboxRuntime` Docker adapter with hardened default profile and versioned profiles under `infra/sandbox/`.
 2. Implement minimal `tools` crate with 1–2 built‑in pentest tools (e.g., `nmap` or a safe HTTP scanner) using the `PentestTool` trait.
-3. End‑to‑end pipeline: `Intent → ValidatedIntent → ExecutionPlan → ValidatedCommand → SandboxRuntime` with artifact recording + audit fields.
+3. Implement the first `ProbeSpec<P>`-based tools in `tools/` plus a basic `ProbeSpecValidator`, matching the ProbeSpec design already defined in the README.
+4. End‑to‑end pipeline: `Intent → ValidatedIntent → ExecutionPlan → ValidatedCommand → SandboxRuntime` with artifact recording + audit fields.
 
 **DoD**: From API, you can create a run that triggers at least one real sandboxed tool execution and persists artifacts + audit logs.
 
@@ -224,6 +227,7 @@ Focus on ports/config that are needed for the MVP slice.
 1. Implement session‑based auth middleware in Axum; SvelteKit hooks to enforce login; all routes 401 when unauthenticated.
 2. SvelteKit run view + SSE cursor replay based on event log (no extra backend state).
 3. Minimal audit view (who approved what, artifacts per action) using structured audit fields.
+4. Introduce a minimal `ValidatorActor` wired into the findings pipeline (even if using a stubbed LLM) so that the adversarial review stage from the README exists end-to-end for at least one probe class.
 
 **DoD**: Operator logs in, starts a run via UI, sees run events live, sees artifacts and audit entries; auth enforced on API and SSE.
 
@@ -274,3 +278,83 @@ Same cadence, but v0.1.0 has a clear product definition.
   - Security and secret CI checks enforced.
 
 Subsequent minor versions (`v0.2.0`, `v0.3.0`) can introduce Firecracker mode, OTEL collector, Langfuse, multi‑node deploy, etc.
+
+
+## 12. Later Enhancements (v0.2.0+)
+
+### Event‑Sourced Attack Surface Graph & Diagrams
+
+Goal: build a typed, event‑sourced Attack Surface Graph (ASG) and use it to
+generate diagrams and coverage-aware views for each run.
+
+#### 12.1 Domain model and projections (v0.2.0)
+
+- Introduce a `domain` (or `model`) crate with pure types:
+  - Core identifiers: `RunId`, `EventId`, `NodeId`, `EdgeId`.
+  - Node enums: `AssetNode`, `IdentityNode`, `FindingNode`, `ProbeNode`, `PathNode`.
+  - Edge enums: `Edge::Reachability`, `Edge::Privilege`, `Edge::Evidence`,
+    `Edge::Covers`, `Edge::Relates`.
+  - Common metadata: `first_seen_at`, `last_seen_at`, `source_event_ids`.
+- Add `DiscoveryGraph` / `AttackSurfaceGraph` types:
+  - `DiscoveryGraph { nodes: HashMap<NodeId, Node>, edges: Vec<Edge> }`.
+  - Versioned per run and snapshot time (T0, T1, …).
+- In `memory`, implement projections from the event log into the ASG:
+  - Map tool results and findings into `AssetNode`, `IdentityNode`, `FindingNode`.
+  - Map executed probes into `ProbeNode` and `Edge::Covers`.
+  - Maintain per‑run graphs in memory, derived from events.
+
+DoD:
+- For a sample run, a unit test can replay recorded events into the domain
+  projection and produce a stable `DiscoveryGraph` snapshot (no IO).
+
+#### 12.2 Diagram rendering (v0.2.x)
+
+- Create a `diagram` crate with:
+  - `DiagramRenderer` trait:
+    - `fn render(&self, graph: &DiscoveryGraph, view: ViewKind) -> String`.
+  - `ViewKind` enum: `Network`, `AttackGraph`, `Coverage`.
+  - `MermaidRenderer` implementation as the initial renderer.
+- Support at least:
+  - Network view: subnets, hosts, services, reachability edges.
+  - Attack graph view: paths, privileges, lateral movement.
+  - Coverage view: tested vs untested targets/attack classes, using `CoverageMap`.
+- Store rendered Mermaid strings as versioned artifacts via `ArtifactStore`
+  with a dedicated content type (e.g. `text/x-mermaid`).
+
+DoD:
+- For a sample run, the UI shows at least a Network view and Attack Graph view
+  derived entirely from the event log and ASG, with diagrams regenerable by
+  replaying events.
+
+#### 12.3 Coverage and scheduling integration (v0.3.0)
+
+- Integrate `CoverageMap` and `GapfillPolicy` into the ASG:
+  - Represent (target, attack_class) state as a node attribute or dedicated edge
+    (`CoverageState::Untested | Partial | Covered | OutOfScope`).
+- Update the orchestrator to use the ASG + CoverageMap as its primary input:
+  - Goal‑driven probing: choose probes that move coverage from Untested/Partial
+    to Covered for a given goal.
+- Extend the Coverage view diagram:
+  - Highlight critical but untested edges.
+  - Provide simple visual cues for scheduling priority.
+
+DoD:
+- Given a synthetic scenario, the orchestrator chooses probes that close
+  explicitly modeled coverage gaps, and the Coverage view reflects the change.
+
+#### 12.4 Temporal and “story” views (v0.4.0+)
+
+- Extend nodes/edges with richer temporal metadata where needed.
+- Implement temporal projections:
+  - Snapshot at time T (state diagrams).
+  - Drift between T0 and T1 (new/removed nodes and edges).
+- Add specialized views:
+  - Kill‑chain story view: single attack path rendered linearly for reports.
+  - Drift view: what changed between two snapshots (hosts, findings, privileges).
+- Expose temporal diagrams as artifacts and via API endpoints
+  (e.g. `GET /runs/:run_id/diagrams/:kind?at=T` or `?from=T0&to=T1`).
+
+DoD:
+- For a demo run with multiple phases, the system can emit:
+  - A kill‑chain story diagram.
+  - A drift diagram showing changes between two milestones.

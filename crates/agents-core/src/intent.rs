@@ -1,6 +1,7 @@
 //! Intent types representing unvalidated agent requests.
 
 use crate::error::ValidationError;
+use crate::scope::ScopeContract;
 use crate::validated::ValidatedIntent;
 
 /// An unvalidated request from an LLM or operator.
@@ -37,7 +38,7 @@ impl Intent {
     /// # Errors
     ///
     /// Returns `ValidationError` if the intent is structurally invalid.
-    pub fn validate(self) -> Result<ValidatedIntent, ValidationError> {
+    pub fn validate(self, scope: &ScopeContract) -> Result<ValidatedIntent, ValidationError> {
         // Basic structural validation
         if self.description.trim().is_empty() {
             return Err(ValidationError::EmptyDescription);
@@ -46,9 +47,20 @@ impl Intent {
             return Err(ValidationError::MissingTarget);
         }
 
+        // Scope validation: security boundary
+        if scope.is_expired() {
+            return Err(ValidationError::ScopeExpired);
+        }
+
+        if !scope.allows_target(&self.target) {
+            return Err(ValidationError::TargetNotInScope {
+                target: self.target.clone(),
+            });
+        }
+
         // SAFETY: This is the ONLY legal constructor for ValidatedIntent.
-        // When ScopeContract is implemented, authorization will happen here.
-        Ok(ValidatedIntent::new(self))
+        // All structural and scope checks have passed.
+        Ok(ValidatedIntent::new(self, scope.authorization_id()))
     }
 }
 
@@ -109,55 +121,123 @@ impl IntentBuilder {
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used)] // Test code: startup-like config validation
+#[allow(clippy::unwrap_used)] // Test code: intentional panic on validation failure
 mod tests {
     use super::*;
+    use uuid::Uuid;
+
+    fn test_uuid() -> Uuid {
+        Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000").expect("valid test UUID")
+    }
+
+    fn test_scope() -> ScopeContract {
+        ScopeContract::builder()
+            .allow_target("192.168.1.1")
+            .allow_target("10.0.0.1")
+            .authorization_id(test_uuid())
+            .build()
+            .expect("valid scope")
+    }
 
     #[test]
-    fn intent_builder_works() {
+    fn builder_creates_intent_with_all_fields() {
         let intent = Intent::builder()
-            .description("Scan target")
-            .target("192.168.1.1")
+            .description("Scan network")
+            .target("192.168.1.0/24")
+            .context("Weekly pentest")
             .build();
 
-        assert_eq!(intent.description, "Scan target");
-        assert_eq!(intent.target, "192.168.1.1");
-        assert!(intent.context.is_none());
+        assert_eq!(intent.description, "Scan network");
+        assert_eq!(intent.target, "192.168.1.0/24");
+        assert_eq!(intent.context, Some("Weekly pentest".to_string()));
     }
 
     #[test]
     fn intent_validation_requires_description() {
+        let scope = test_scope();
         let intent = Intent::builder()
-            .description("")
+            .description("") // Empty description should fail validation
             .target("192.168.1.1")
             .build();
 
         assert!(matches!(
-            intent.validate(),
+            intent.validate(&scope),
             Err(ValidationError::EmptyDescription)
         ));
     }
 
     #[test]
     fn intent_validation_requires_target() {
+        let scope = test_scope();
         let intent = Intent::builder()
             .description("Scan target")
-            .target("")
+            .target("") // Empty target should fail validation
             .build();
 
         assert!(matches!(
-            intent.validate(),
+            intent.validate(&scope),
             Err(ValidationError::MissingTarget)
         ));
     }
 
     #[test]
     fn valid_intent_passes_validation() {
+        let scope = test_scope();
         let intent = Intent::builder()
             .description("Scan target")
             .target("192.168.1.1")
             .context("Pentest engagement #123")
             .build();
 
-        assert!(intent.validate().is_ok());
+        assert!(intent.validate(&scope).is_ok());
+    }
+
+    #[test]
+    fn intent_validation_rejects_out_of_scope_target() {
+        let scope = test_scope();
+        let intent = Intent::builder()
+            .description("Scan unauthorized target")
+            .target("203.0.113.1") // Not in allowed_targets
+            .build();
+
+        assert!(matches!(
+            intent.validate(&scope),
+            Err(ValidationError::TargetNotInScope { .. })
+        ));
+    }
+
+    #[test]
+    fn intent_validation_rejects_expired_scope() {
+        use chrono::{Duration, Utc};
+
+        let expired_scope = ScopeContract::builder()
+            .allow_target("192.168.1.1")
+            .authorization_id(test_uuid())
+            .valid_until(Utc::now() - Duration::hours(1))
+            .build()
+            .expect("valid scope");
+
+        let intent = Intent::builder()
+            .description("Scan target")
+            .target("192.168.1.1")
+            .build();
+
+        assert!(matches!(
+            intent.validate(&expired_scope),
+            Err(ValidationError::ScopeExpired)
+        ));
+    }
+
+    #[test]
+    fn validated_intent_preserves_authorization_id() {
+        let scope = test_scope();
+        let intent = Intent::builder()
+            .description("Scan target")
+            .target("192.168.1.1")
+            .build();
+
+        let validated = intent.validate(&scope).unwrap();
+        assert_eq!(validated.authorization_id(), test_uuid());
     }
 }

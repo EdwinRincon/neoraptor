@@ -1,6 +1,7 @@
 //! Validated types in the typestate pipeline.
 
 use crate::intent::Intent;
+use uuid::Uuid;
 
 /// A validated intent that has passed authorization checks.
 ///
@@ -16,6 +17,10 @@ use crate::intent::Intent;
 pub struct ValidatedIntent {
     /// The original intent that was validated.
     intent: Intent,
+
+    /// Authorization ID from the scope contract used to validate this intent.
+    /// Links this validated intent to an audit trail.
+    authorization_id: Uuid,
 }
 
 impl ValidatedIntent {
@@ -23,13 +28,21 @@ impl ValidatedIntent {
     ///
     /// This constructor is `pub(crate)` and can only be called from within
     /// this crate, specifically from `Intent::validate()`.
-    pub(crate) fn new(intent: Intent) -> Self {
-        Self { intent }
+    pub(crate) fn new(intent: Intent, authorization_id: Uuid) -> Self {
+        Self {
+            intent,
+            authorization_id,
+        }
     }
 
     /// Get a reference to the original intent.
     pub fn intent(&self) -> &Intent {
         &self.intent
+    }
+
+    /// Get the authorization ID that was used to validate this intent.
+    pub fn authorization_id(&self) -> Uuid {
+        self.authorization_id
     }
 
     /// Convert this validated intent into an execution plan.
@@ -123,20 +136,36 @@ impl ValidatedCommand {
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used)] // Test code: startup-like config validation
 mod tests {
     use super::*;
     use crate::intent::Intent;
+    use crate::scope::ScopeContract;
+    use uuid::Uuid;
+
+    fn test_uuid() -> Uuid {
+        Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000").expect("valid test UUID")
+    }
+
+    fn test_scope() -> ScopeContract {
+        ScopeContract::builder()
+            .allow_target("192.168.1.1")
+            .authorization_id(test_uuid())
+            .build()
+            .expect("valid scope")
+    }
 
     #[test]
     #[allow(clippy::expect_used)] // Test code
     fn typestate_pipeline_works() {
         // Intent → ValidatedIntent → ExecutionPlan → ValidatedCommand
+        let scope = test_scope();
         let intent = Intent::builder()
             .description("Scan target")
             .target("192.168.1.1")
             .build();
 
-        let validated = intent.validate().expect("validation should succeed");
+        let validated = intent.validate(&scope).expect("validation should succeed");
         let mut plan = validated.into_plan();
         plan.add_step("nmap -sV 192.168.1.1");
 
@@ -152,7 +181,7 @@ mod tests {
 
     #[test]
     fn validated_command_is_not_clone() {
-        // This test exists to document the invariant.
+        // This test documents the invariant.
         // If ValidatedCommand ever derives Clone, this will fail to compile.
         fn assert_not_clone<T: ?Sized>() {}
         assert_not_clone::<ValidatedCommand>();

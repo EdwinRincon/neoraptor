@@ -1,8 +1,9 @@
 //! NEORAPTOR API server entrypoint.
 
-#![allow(missing_docs)]
-
-use api::{create_router, AppState};
+use api::{
+    bootstrap::{default_supervisor_policy, RootSupervisor},
+    create_router, AppState, StubSandbox,
+};
 use config::DatabaseConfig;
 use db::{connect_database, PostgresArtifactStore, PostgresEventBus};
 use secrecy::Secret;
@@ -43,8 +44,17 @@ async fn main() -> anyhow::Result<()> {
     let event_bus = Arc::new(PostgresEventBus::new(pool.clone()));
     let artifact_store = Arc::new(PostgresArtifactStore::new(pool.clone()));
 
+    // Create supervisor with stub sandbox for Week 4
+    let sandbox = Arc::new(StubSandbox);
+    let supervisor_policy = default_supervisor_policy();
+    let supervisor = Arc::new(RootSupervisor::spawn(
+        sandbox,
+        event_bus.clone(),
+        supervisor_policy,
+    ));
+
     // Build application state
-    let state = AppState::new(pool, event_bus, artifact_store);
+    let state = AppState::new(pool, event_bus, artifact_store, supervisor);
 
     // Create router with all routes
     let app = create_router(state);

@@ -1,5 +1,3 @@
-#![allow(missing_docs)]
-
 //! Database layer with Postgres-backed implementations of EventBus and ArtifactStore.
 
 pub mod artifact_store;

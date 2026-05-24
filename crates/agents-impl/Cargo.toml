@@ -6,6 +6,15 @@ rust-version.workspace = true
 license = "Apache-2.0"
 
 [dependencies]
+agents-core = { path = "../agents-core" }
+ports = { path = "../ports" }
+tokio.workspace = true
+tokio-util.workspace = true
+uuid.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+bytes.workspace = true
+serde_json.workspace = true
 
 [lints]
 workspace = true

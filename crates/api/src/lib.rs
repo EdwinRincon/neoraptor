@@ -3,18 +3,22 @@
 //! Provides HTTP endpoints for testing and exercising the persistence stack
 //! (EventBus, ArtifactStore). This is an internal-only API for v0.1.
 
-#![allow(missing_docs)]
-
 mod dto;
 mod error;
 mod routes;
+mod stub_sandbox;
+
+pub mod bootstrap;
 
 use axum::{routing::get, Router};
+use bootstrap::RootSupervisor;
 use db::{DbPool, PostgresArtifactStore, PostgresEventBus};
 use std::sync::Arc;
 use tower_http::trace::TraceLayer;
 
+pub use dto::*;
 pub use error::ApiError;
+pub use stub_sandbox::StubSandbox;
 
 /// Application state shared across all request handlers.
 ///
@@ -24,6 +28,7 @@ pub struct AppState {
     pool: DbPool,
     event_bus: Arc<PostgresEventBus>,
     artifact_store: Arc<PostgresArtifactStore>,
+    supervisor: Arc<RootSupervisor<StubSandbox, PostgresEventBus>>,
 }
 
 impl AppState {
@@ -32,11 +37,13 @@ impl AppState {
         pool: DbPool,
         event_bus: Arc<PostgresEventBus>,
         artifact_store: Arc<PostgresArtifactStore>,
+        supervisor: Arc<RootSupervisor<StubSandbox, PostgresEventBus>>,
     ) -> Self {
         Self {
             pool,
             event_bus,
             artifact_store,
+            supervisor,
         }
     }
 
@@ -53,6 +60,11 @@ impl AppState {
     /// Get a reference to the artifact store.
     pub fn artifact_store(&self) -> &Arc<PostgresArtifactStore> {
         &self.artifact_store
+    }
+
+    /// Get a reference to the supervisor.
+    pub fn supervisor(&self) -> &Arc<RootSupervisor<StubSandbox, PostgresEventBus>> {
+        &self.supervisor
     }
 }
 

@@ -163,6 +163,10 @@ graph TB
     OTEL -->|dashboards| GRAF
 ```
 
+Artifacts include raw tool outputs, normalized findings, and higher-level
+views such as generated Mermaid diagrams of the current discovery graph.
+
+
 ### Container-level improvements
 
 - **No MQ service initially**: internal Tokio channels handle in-process coordination; we only add Kafka or RabbitMQ when a measured need appears.
@@ -543,6 +547,35 @@ Summarization remains within `memory/` until it justifies a split.
 - Embeddings are `Arc<[f32]>` from `LlmProvider::embed` (ADR-001).
 - Large `AgentMessage` variants are boxed, enforced by `large_enum_variant = "deny"`.
 - Large tool output is stored separately from compact event records so the event stream stays light.
+
+
+### Live Attack Surface Maps
+
+NEORAPTOR builds a structured view of the target as it works. Every tool run,
+finding, and agent decision is recorded in the event log and projected into a
+typed discovery graph.
+
+This graph models:
+
+- Hosts, subnets, and services (ports, banners, protocol hints).
+- Users, groups, and privilege edges on Windows and Linux.
+- Application entry points, data flows, and confirmed findings.
+- Attack paths – chains of steps from initial access to impact.
+
+From this graph, NEORAPTOR continuously generates **Mermaid diagrams** as
+artifacts:
+
+- Network view: subnets, hosts, and service exposure.
+- Attack graph view: pivot paths, privileges, and lateral movement.
+- Coverage view: which targets and attack classes have been exercised.
+
+These diagrams are versioned artifacts stored in Postgres via the
+`ArtifactStore` and exposed through the API. The UI can render them directly,
+embed them in run dashboards, or export them for external reports.
+
+Because diagrams are derived from the append‑only event log, they are always
+reproducible and reflect the actual actions taken by the engine – not a static
+drawing that went stale the week it was created.
 
 ***
 

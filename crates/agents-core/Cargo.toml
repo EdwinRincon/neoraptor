@@ -8,6 +8,8 @@ license = "Apache-2.0"
 [dependencies]
 thiserror.workspace = true
 serde = { version = "1", features = ["derive"] }
+uuid.workspace = true
+chrono.workspace = true
 
 [lints]
 workspace = true
