@@ -6,7 +6,7 @@ rust-version.workspace = true
 license = "Apache-2.0"
 
 [dependencies]
-secrecy = { version = "0.8", features = ["serde"] }
+secrecy = { version = "0.10", features = ["serde"] }
 serde = { workspace = true }
 figment = { version = "0.10", features = ["toml", "env"] }
 

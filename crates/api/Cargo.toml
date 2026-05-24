@@ -25,7 +25,7 @@ bytes = { workspace = true }
 # Error handling (allowed in api crate per deny.toml)
 anyhow = "1"
 thiserror = { workspace = true }
-secrecy = { version = "0.8", features = ["serde"] }
+secrecy = { version = "0.10", features = ["serde"] }
 
 # Local crates
 db = { path = "../db" }
