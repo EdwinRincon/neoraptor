@@ -1,0 +1,42 @@
+# Claude Code / LeanCTX local data
+.claude/settings.local.json
+.claude/memory/
+.claude/sessions/
+.claude/cache/
+.lean-ctx/
+
+# Windows
+Thumbs.db
+Thumbs.db:encryptable
+ehthumbs.db
+ehthumbs_vista.db
+Desktop.ini
+$RECYCLE.BIN/
+
+# Linux / generic
+*~
+.fuse_hidden*
+.Trash-*
+
+
+# --- Editors / IDEs (personal settings) ---
+.vscode/
+.github/
+
+
+# Vim / Emacs / others
+*.swp
+*.swo
+*.swn
+\#*#
+*.un~
+
+# Added by cargo
+
+/target
+
+# others
+useful_commands.txt
+# Environment variables (use .env.example as template)
+.env
+.env.local
