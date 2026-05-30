@@ -43,15 +43,17 @@ See `justfile` for additional commands.
 
 ## Architecture
 
-For the full architectural design, including:
+NEORAPTOR is an autonomous offensive-security control plane built on event-sourced runs and typed tool orchestration.
 
-- System philosophy (Find/Fix/Verify/Visibility/Prioritization)
-- Control Plane vs Execution Plane separation
-- Core domain model (RunEvent, ScopeContract, ProbeSpec, EvidenceArtifact, CoverageMap)
-- Typed autonomy loop and actor roles
-- Tools, sandbox runtime, and governance
+**Start here:** [docs/architecture.md](docs/architecture.md) — High-level system overview (~5 min read)
 
-**→ Read [docs/architecture.md](docs/architecture.md)**
+**Detailed docs:**
+- [docs/domain-model.md](docs/domain-model.md) — RunEvent, ScopeContract, ProbeSpec, Evidence
+- [docs/runtime.md](docs/runtime.md) — Actors, backpressure, supervision, shutdown
+- [docs/security.md](docs/security.md) — ScopeContract enforcement, sandboxes, governance
+- [docs/observability.md](docs/observability.md) — Metrics, traces, coverage, heap health
+- [docs/testing.md](docs/testing.md) — Testing strategy, macro stability, CI
+- [docs/adr/](docs/adr/) — Architecture decision records
 
 ---
 
