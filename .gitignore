@@ -22,6 +22,8 @@ $RECYCLE.BIN/
 # --- Editors / IDEs (personal settings) ---
 .vscode/
 .github/
+!.github/workflows/
+!.github/dependabot.yml
 
 
 # Vim / Emacs / others
