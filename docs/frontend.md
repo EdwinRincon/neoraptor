@@ -1,185 +1,324 @@
 # Overview
 
-The NEORAPTOR frontend serves as the **transparent** control surface for an autonomous offensive-security operating system. It translates immutable event streams into an operator-centric dashboard, proving what actions the AI took and mathematically guaranteeing those actions remained within allowed boundaries.
+The NEORAPTOR frontend is the operator-facing control surface for an autonomous offensive-security system. It turns immutable event streams into a dense, auditable dashboard so operators can inspect what happened, why it happened, and whether every action stayed within scope.
 
-This interface must prioritize **determinism** over abstraction, ensuring operators can forensically audit, pause, and rewind autonomous execution without wrestling with black-box UI components.
+This UI must favor determinism over decoration. Operators should be able to audit, pause, resume, and replay runs without relying on opaque client-side behavior.
 
 Primary users:
 
-* Security Operators (Red Team/SecOps) executing and steering active campaigns.
-* Risk Strategists (CISO/CTO) verifying DORA/NIS2 compliance via scope constraints.
+- Security operators running and steering active campaigns.
+- Risk strategists verifying scope, control boundaries, and compliance evidence.
 
 Core UX goals:
 
-* Explainability: Surface the exact reasoning behind every planned probe.
-* Traceability: Map every finding back to its raw sandbox evidence.
-* Density: Maximize screen real estate for logs and data; avoid whitespace-heavy consumer layouts.
-* Trust: Constantly visualize the active `ScopeContract` to prove execution safety.
+- Explainability: Surface the reasoning behind each planned probe.
+- Traceability: Link findings back to raw sandbox evidence.
+- Density: Maximize data visibility with compact layouts.
+- Trust: Always show the active `ScopeContract` and its enforcement state.
+- Resilience: Preserve usability during reconnects, partial data, and high event volume.
 
-# Information Architecture
+## Product principles
 
-Top-level UI navigation relies on a persistent left-rail menu containing: Runs, Targets, Findings, Attack Chains, Scope, Evidence, and Settings/Audit.
+- The event log is the source of truth.
+- The UI is a projection, not the system of record.
+- Scope violations must be visible immediately.
+- Untrusted execution output must never be treated as authoritative until validated.
+- Operator actions and automated actions must be visually distinguishable.
+- Every screen must remain usable on a single monitor in a dense, high-stress workflow.
+
+## Deployment Model
+
+NEORAPTOR should be built as a self-hosted private web platform, not as a desktop app or SaaS-only product. The frontend is a browser UI served by the private control-plane service, while the backend runs inside Docker in the customer’s environment so event logs, evidence, and scope enforcement stay under operator control.
+
+### What engineers need to build
+
+- A Dockerized control plane that serves the frontend and API.
+- SSE for live run updates.
+- Server-side projection logic for expensive event derivations.
+- Client-side derived stores only for lightweight UI state such as filters, visible selections, and status maps.
+- Private persistence for runs, events, findings, and evidence.
+- A reverse-proxy-friendly setup for on-prem, sovereign cloud, or private VPC deployment.
+
+### Why this is the right fit
+
+This matches the product’s core requirements: deterministic auditability, scope enforcement, evidence retention, and compliance-friendly deployment for regulated environments. It also avoids the weaknesses of a desktop app, which would make shared audit logs, live collaboration, and central policy enforcement harder to operate at scale.
+
+### Implementation guidance
+
+For v0.1, ship a single-host Docker Compose deployment with the API, frontend, event store, and database in one private stack. Later, split components into separate services if scale or enterprise isolation requires it, but keep the product’s default identity as a self-hosted operator platform.
+
+## Information Architecture
+
+Top-level navigation should use a persistent left rail with:
+
+- Runs.
+- Targets.
+- Findings.
+- Scope.
+- Evidence.
+- Audit.
+
+The global shell should keep three elements always visible:
+
+- Current run selector.
+- Scope status banner.
+- Connection state indicator.
 
 Mapping backend concepts to UI primitives:
 
-* **RunEvent**: Maps directly to a chronological timeline node. The UI reduces these immutable events into current-state projections for dashboards.
-* **ScopeContract**: Maps to a persistent, read-only "Safety Boundary" indicator. This banner visually proves the cryptographic rules of engagement for the active run.
-* **ProbeSpec**: Maps to a typed "Task Card" detailing the vulnerability class, target, and version. It includes a split-pane view connecting the planner's intent to the executor's result.
-* **EvidenceArtifact**: Maps to a capped, high-performance evidence viewer. It handles streaming text up to 10MB, warning the user if truncation occurred.
+- `RunEvent`: A chronological timeline node in an append-only event feed. The UI derives current state from this log.
+- `ScopeContract`: A persistent read-only safety indicator that shows the currently enforced rules of engagement.
+- `ProbeSpec`: A typed task card showing probe intent, target, and execution status.
+- `EvidenceArtifact`: A capped evidence viewer for sandbox output, with truncation warnings when the artifact exceeds limits.
 
-# Core Screens and User Flows
+## Core Screens
 
 ### Run List
 
-Provides a high-level overview of all historical and active runs.
+Shows all historical and active runs.
 
-* Layout regions: Header (global stats), main panel (data table).
-* Primary actions: Initiate new run, filter by status, export compliance log.
-* Navigation: Click row to enter Run Detail.
+- Layout: Header with global stats, main table of runs.
+- Primary actions: Start run, filter by status, export audit log.
+- Navigation: Open a row to enter run detail.
+- Required columns: Run name, status, scope, start time, last event, findings count, operator.
 
 ### Run Detail
 
-Serves as the mission control dashboard for a specific execution.
+Provides the mission-control dashboard for one run.
 
-* Layout regions: Left nav (contextual), header (run metadata), main panel (metrics/graphs), side panel (live event feed).
-* Primary actions: Pause/resume execution, view active scope, acknowledge critical alerts.
-* Navigation: Sub-routes for timeline, probes, and findings.
+- Layout: Header with run metadata, main metrics area, side event feed.
+- Primary actions: Pause, resume, inspect scope, acknowledge alerts.
+- Navigation: Subroutes for timeline, probes, findings, and scope.
+- Required summary signals: run state, active scope status, event throughput, failed probes, confirmed findings.
 
 ### Event Timeline
 
-Acts as the forensic audit log and time-travel debugging interface.
+Acts as the forensic audit log for the run.
 
-* Layout regions: Main panel (virtualized vertical list), right details modal (event JSON).
-* Primary actions: Filter by event type, jump to timestamp, expand raw payload, initiate time-travel fork.
-* Navigation: Links outward to specific Probe Details or Findings.
+- Layout: Virtualized vertical list with a details panel for raw event JSON.
+- Primary actions: Filter by event type, jump to timestamp, expand raw payload.
+- Navigation: Links to probe detail and findings.
+- Default behavior: Auto-follow newest events until the user scrolls away or pauses live mode.
 
 ### Probe Detail
 
-Explains the lifecycle of a single typed tool execution.
+Explains a single typed tool execution.
 
-* Layout regions: Header (status badge), main panel (spec vs actual), side panel (reasoning).
-* Primary actions: Inspect tool arguments, view execution latency, navigate to generated evidence.
-* Navigation: Accessed via Timeline or Findings; links to Evidence Viewer.
+- Layout: Header with status, main spec-versus-result view, side reasoning panel.
+- Primary actions: Inspect arguments, check latency, open evidence.
+- Navigation: Entered from timeline or findings.
+- Label planner output clearly as intent, not evidence.
 
 ### Evidence Viewer
 
-Renders the raw, sandboxed output returned by the execution plane.
+Renders sandbox output returned by execution.
 
-* Layout regions: Header (artifact metadata), main panel (tabbed text/hex viewer).
-* Primary actions: Switch format tabs, download raw artifact, search output.
-* Navigation: Modal or full-page takeover from Probe Detail.
+- Layout: Header with artifact metadata, main plain-text viewer.
+- Primary actions: Copy text, download raw artifact, search within output.
+- Navigation: Opened from probe detail or findings.
+- Display truncation state prominently when output exceeds limits.
 
 ### Findings View
 
-Displays confirmed vulnerabilities distilled from raw evidence.
+Shows confirmed vulnerabilities derived from evidence.
 
-* Layout regions: Main panel (grouped data table), side panel (remediation/escalation).
-* Primary actions: Approve escalation, mark false positive, export finding.
-* Navigation: Links back to originating Probe and Attack Chain.
-
-### Attack Chain/Escalation View
-
-Visualizes lateral movement and synthesized vulnerabilities.
-
-* Layout regions: Main panel (node-based graph).
-* Primary actions: Inspect node, approve cross-boundary escalation.
-* Navigation: Pan/zoom canvas, click node to open Finding Details.
+- Layout: Dense table with severity, target, and status.
+- Primary actions: Approve escalation, mark false positive, export finding.
+- Navigation: Back to originating probe and related scope context.
+- Findings should always link to source evidence and confirming events.
 
 ### Scope View
 
-Displays the immutable rules of engagement protecting the production environment.
+Displays the immutable rules of engagement.
 
-* Layout regions: Main panel (read-only contract viewer).
-* Primary actions: Export cryptographically signed contract.
-* Navigation: Read-only tab within Run Detail.
+- Layout: Read-only contract viewer.
+- Primary actions: Export signed contract.
+- Navigation: Accessible from run detail and global navigation.
+- Show effective scope, exclusions, time bounds, and tool restrictions.
 
-# Event-Sourced UI Model
+### Audit View
 
-The UI state is fundamentally a derived projection of the backend's `RunEvent` log. The frontend will fetch the historical event log on load (`GET /runs/:id/events`) and immediately subscribe to an SSE endpoint (`GET /runs/:id/stream`) for live updates.
+Shows operator actions, policy decisions, and administrative events.
 
-We will compute lightweight projections (like timeline filtering and probe status maps) **client-side** using Svelte derived stores. Heavy projections (like the Attack Chain graph) will be computed **server-side** to avoid overloading the browser.
+- Layout: Filterable event and action log.
+- Primary actions: Filter by actor, event type, and time range.
+- Navigation: Links back to runs and scope changes.
 
-Events are inherently ordered by the backend. We will enforce deduplication and stable rendering using the backend-issued monotonic `sequence_id`.
+## Event Model
 
-If the SSE connection drops, the client will reconnect passing the last known `sequence_id`. The client will reconcile truncated evidence by displaying a persistent warning banner on the specific artifact, ensuring the operator knows data was capped by the sandbox backpressure rules.
+The UI state is a projection of the backend `RunEvent` log. On load, the frontend fetches historical events and then subscribes to SSE for live updates.
 
-# SvelteKit Architecture
+Recommended flow:
 
-Concrete route structure:
+- `GET /runs/:id/events` for the baseline event set.
+- `GET /runs/:id/stream` for live updates.
+- Reconnect with the last known `sequence_id` after any SSE interruption.
+- Deduplicate by `sequence_id` before applying events.
+- Request missing events from the server if a gap is detected.
 
-* `/runs` (Run list)
-* `/runs/[id]` (Run dashboard)
-* `/runs/[id]/timeline` (Virtualized event log)
-* `/runs/[id]/probes/[probe_id]` (Probe execution details)
-* `/runs/[id]/scope` (Read-only contract view)
-* `/targets` (Global target inventory)
+Use lightweight client-side derived stores for simple projections such as status maps and filtered timelines. Keep heavier projections server-side when they would be expensive to compute in the browser.
 
-Nested layouts will utilize `src/routes/runs/[id]/+layout.svelte` to fetch and provide the core run context (ScopeContract, baseline events) to all child routes.
+Use backend-issued monotonic `sequence_id` values for deduplication and stable rendering.
 
-Page-level data loading (`+page.server.ts`) will handle initial SSR hydration for SEO/performance, while `+page.svelte` `onMount` hooks will establish the SSE connections.
+## SvelteKit Structure
 
-File layout:
+Suggested routes:
+
+- `/runs` — Run list.
+- `/runs/[id]` — Run dashboard.
+- `/runs/[id]/timeline` — Event timeline.
+- `/runs/[id]/probes/[probe_id]` — Probe detail.
+- `/runs/[id]/findings` — Findings list.
+- `/runs/[id]/scope` — Scope view.
+- `/targets` — Global target inventory.
+- `/audit` — Audit log.
+
+Recommended loading pattern:
+
+- `+layout.server.ts` for run-scoped SSR data such as scope and baseline events.
+- `+layout.svelte` for shared shell and SSE provider wiring.
+- `+page.server.ts` for route-specific initial data.
+- `onMount` for starting client-side SSE subscriptions.
+- `+error.svelte` for route-scoped failures and reconnect fallback.
+- `load` only for serializable data needed by the page.
+
+Suggested file layout:
 
 ```text
 src/
 ├── lib/
 │   ├── components/
-│   │   ├── core/       (Buttons, Badges, Modals)
-│   │   ├── domain/     (EventCard, EvidenceViewer, ScopeBanner)
-│   ├── stores/         (sse.ts, runState.ts)
-│   ├── models/         (types.ts for Event, ProbeSpec, ScopeContract)
+│   │   ├── core/
+│   │   └── domain/
+│   ├── stores/
+│   ├── models/
+│   └── utils/
 ├── routes/
-│   ├── runs/
-│   │   ├── [id]/
-│   │   │   ├── timeline/
-│   │   │   ├── probes/
-
+│   ├── (app)/
+│   │   ├── +layout.server.ts
+│   │   ├── +layout.svelte
+│   │   ├── runs/
+│   │   │   ├── [id]/
+│   │   │   │   ├── +layout.server.ts
+│   │   │   │   ├── +layout.svelte
+│   │   │   │   ├── +error.svelte
+│   │   │   │   ├── +page.server.ts
+│   │   │   │   ├── +page.svelte
+│   │   │   │   ├── timeline/
+│   │   │   │   ├── probes/
+│   │   │   │   ├── findings/
+│   │   │   │   └── scope/
+│   │   ├── targets/
+│   │   └── audit/
 ```
 
-# State Management Strategy
+## State Management
 
-Server-loaded data serves as the immutable baseline, while client state manages the real-time delta.
+Use server-loaded data as the immutable baseline and client state as the real-time delta.
 
-The event stream state will utilize a custom Svelte store `runEvents` (an array of typed events). Derived stores, such as `activeProbes` and `confirmedFindings`, will automatically react to new events pushed into `runEvents`.
+Recommended stores:
 
-Selected UI states (e.g., currently viewed probe, active evidence tab) will be managed via URL query parameters or local component state to ensure deep-linking works natively.
+- `runEvents`: Array of typed events.
+- `activeProbes`: Derived from `runEvents`.
+- `confirmedFindings`: Derived from `runEvents`.
+- `connectionState`: SSE status for the current run.
+- `uiFilters`: Local route-scoped filters and view options.
 
-The following must **not** be global: raw evidence text (kept local to the Evidence Viewer to prevent memory leaks), SSE connections (scoped to the run layout), and UI filter inputs.
+Keep these out of global state:
 
-# Real-Time UX
+- Raw evidence text.
+- SSE connection objects outside the run layout scope.
+- Local filter controls.
+- Per-route transient selection state that should reset on navigation.
 
-Live event volume can be extremely high during active enumeration.
+State rules:
 
-* Live indicator: A pulsing green dot in the run header indicating active SSE connection.
-* Auto-scroll: The timeline auto-scrolls to the bottom by default; scrolling up automatically pauses the feed (showing a "New events paused" pill).
-* Buffering: DOM nodes in the timeline must be virtualized (`svelte-virtual-list`) to prevent browser crashing when events exceed 10,000.
-* Truncation warnings: Artifacts exceeding 10MB display a fixed, amber warning header stating "Output capped by execution limits."
-* Backpressure: If the client struggles to render, the SSE store will batch event updates via `requestAnimationFrame`.
+- All store mutations must be append-like or resettable from server truth.
+- Derived data must be deterministic from the event stream.
+- Switching runs must fully dispose of the previous run connection and reset transient state.
 
-# Reusable Components and Design System
+## Real-Time UX
 
-* `TimelineNode`: A vertical list item with a connecting left border, displaying event timestamp, type icon, and summary.
-* `StatusBadge`: A small, colored pill (Pending, Running, Failed, Success) with deterministic colors.
-* `SeverityChip`: A dense indicator (Low, Med, High, Critical) using standard security traffic-light colors.
-* `EvidenceTabs`: A tabbed container switching between Raw Text, Hex Dump, and Parsed JSON.
-* `ScopeBanner`: A persistent header element showing the `authorization_id` and an "In Scope" green shield.
+Live event volume can be high during active runs.
 
-Visual principles require a dark-mode default to reduce eye strain for operators. The layout must use high-density padding (4px/8px scales) to maximize data visibility. Color usage is strictly semantic: red is exclusively reserved for sandbox failures or critical findings.
+- Show a live connection indicator in the run header.
+- Auto-scroll the timeline by default, but pause when the user scrolls away.
+- Virtualize timeline rows once event counts grow large.
+- Show a fixed truncation warning when evidence exceeds backend caps.
+- Batch event rendering when the client is under load.
+- Display a sync gap state if the client detects missing events or reconnect delay.
 
-# Explainability and Error States
+Recommended thresholds for v0.1:
 
-To surface "why" an action occurred, the UI must trace `ProbeDispatched` events back to the planner's reasoning payload. The `Probe Detail` screen will feature a dedicated "Autonomy Intent" block explaining the planner's decision.
+- Virtualize timelines after a few hundred visible rows.
+- Batch incoming SSE updates during bursts instead of rendering per event.
+- Preserve scroll position when the user is not in auto-follow mode.
 
-Policy violations and sandbox failures must be explicitly distinct.
+## Components
 
-* If a `ScopeContract` violation occurs during planning, display a **yellow** "Policy Blocked" badge; this is a system working as intended.
-* If a sandbox crashes or times out, display a **red** "Execution Failure" badge, advising the operator to inspect the executor logs.
-* Partial evidence from timeouts must render normally but append an "Incomplete Artifact" warning chip.
+Reusable components should stay small and domain-specific:
 
-# v0.1 Scope
+- `TimelineNode`: Timestamp, type, and summary in one compact row.
+- `StatusBadge`: Deterministic status pill for pending, running, failed, success.
+- `SeverityChip`: Dense severity indicator for findings.
+- `EvidenceViewer`: Plain-text artifact viewer for v0.1.
+- `ScopeBanner`: Persistent read-only scope indicator.
+- `EventDetailsPanel`: Raw JSON view for selected events.
+- `ConnectionStatePill`: Live SSE status and reconnect state.
 
-The minimum viable frontend slice must focus strictly on the core loop:
+Visual rules:
 
-* Includes: Run list, virtualized event timeline, basic probe detail view, plain-text evidence viewer, and static scope indicator.
-* Postpones: Node-based attack graphs, interactive time-travel forks, multi-tenant RBAC, and hex/JSON evidence parsing.
-* Simplifies: Findings will be presented as a flat table rather than a hierarchical tree.
+- Dark mode by default.
+- Compact spacing for operator density.
+- Semantic color only: red for failures and critical findings, yellow for policy blocks or warnings, green for in-scope success states.
+- Do not use color alone to communicate status.
+- Every status badge must also include text or iconography.
+
+## Explainability
+
+The UI must expose “why” an action happened.
+
+- Show the planner reasoning payload for `ProbeDispatched` events.
+- Present a dedicated intent block in probe detail.
+- Distinguish policy blocks from execution failures.
+- Keep planner reasoning visually separate from execution evidence.
+- Label inferred intent as system output, not ground truth.
+
+State handling:
+
+- Policy violation: yellow “Policy Blocked” badge.
+- Sandbox crash or timeout: red “Execution Failure” badge.
+- Partial evidence: normal rendering plus an “Incomplete Artifact” warning.
+
+## Accessibility and safety
+
+- All interactive controls must be keyboard accessible.
+- Timelines and tables must expose semantic structure to assistive technology.
+- Live regions should announce critical status changes sparingly.
+- Focus must move predictably when opening drawers, panels, or route transitions.
+- Use confirmation steps for destructive operator actions such as escalation approval or scope edits.
+
+## V0.1 Scope
+
+The minimum viable slice should include:
+
+- Run list.
+- Run detail.
+- Virtualized event timeline.
+- Basic probe detail.
+- Plain-text evidence viewer.
+- Static scope indicator.
+- Flat findings table.
+- Live SSE reconnect and deduplication.
+- Basic accessibility support.
+- Route-scoped error handling.
+
+Postpone:
+
+- Attack-chain graph.
+- Time-travel forks.
+- Hex/JSON evidence tabs.
+- Multi-tenant RBAC.
+- Advanced remediation workflows.
+- Nonessential dashboard polish.
+- Rich visual analytics beyond simple density and status summaries.
