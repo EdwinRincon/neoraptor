@@ -6,9 +6,9 @@ This document describes the core domain types in `agents-core` that model NEORAP
 
 NEORAPTOR's domain model is built on three foundational principles:
 
-1. **Event sourcing**: State is derived from an append-only log of `RunEvent`s
-2. **Type-level safety**: Probes carry vulnerability class and schema version in their types
-3. **Fail-closed governance**: `ScopeContract` violations are compile-time or planning-time errors, never execution-time surprises
+1. **Event sourcing**: State is derived from an append-only log of `RunEvent`s.
+2. **Type-level safety**: Probes carry vulnerability class and schema version in their types.
+3. **Fail-closed governance**: `ScopeContract` violations are compile-time or planning-time errors, never execution-time surprises.
 
 All types described here live in `crates/agents-core/src/` and are shared across control plane and execution plane.
 
@@ -16,33 +16,34 @@ All types described here live in `crates/agents-core/src/` and are shared across
 
 `RunEvent` is the atomic unit of state in NEORAPTOR. Every action produces an immutable event written to the append-only event log.
 
-### Core Event Types
+### Core Event Categories
+
+At a high level, events cover:
+
+- **Run lifecycle**: `RunInitiated`, `RunCompleted`, `RunAborted`.
+- **Target discovery**: `TargetDiscovered`.
+- **Probe lifecycle**: `ProbeDispatched`, `ProbeCompleted`, `ProbeFailed`.
+- **Findings**: `FindingConfirmed`, `FalsePositive`.
+- **Escalations**: `EscalationProposed`, `EscalationTransitioned`.
+- **Coverage**: `CoverageUpdated`.
 
 ```rust
 pub enum RunEvent {
-    // Run lifecycle
-    RunInitiated { scope: ScopeContract, targets: Vec<Target>, objectives: Vec<String> },
-    RunCompleted { summary: String, coverage: CoverageMap, final_status: RunStatus },
-    RunAborted { reason: String },
-
-    // Target discovery
-    TargetDiscovered { target: Target, discovered_via: Option<RunEventId> },
-    
-    // Probe lifecycle
-    ProbeDispatched { probe: ProbeSpec<impl VulnerabilityClass, const V: u32>, preconditions: Vec<RunEventId> },
-    ProbeCompleted { probe_id: RunEventId, evidence: Vec<EvidenceArtifact>, execution_ms: u64 },
-    ProbeFailed { probe_id: RunEventId, error: ProbeError, retry_count: u32 },
-    
-    // Finding confirmation
-    FindingConfirmed { probe_id: RunEventId, vulnerability: ConfirmedVulnerability, severity: Severity },
-    FalsePositive { probe_id: RunEventId, reason: String },
-    
-    // Escalation management
-    EscalationProposed { from: RunEventId, to: ProbeSpec<impl VulnerabilityClass, const V: u32>, rationale: String },
-    EscalationTransitioned { proposal_id: RunEventId, new_state: EscalationState },
-    
-    // Coverage tracking
-    CoverageUpdated { dimension: CoverageDimension, delta: CoverageDelta },
+    RunInitiated { /* ... */ },
+    RunCompleted { /* ... */ },
+    RunAborted { /* ... */ },
+    // ...
+    ProbeDispatched { /* ... */ },
+    ProbeCompleted { /* ... */ },
+    ProbeFailed { /* ... */ },
+    // ...
+    FindingConfirmed { /* ... */ },
+    FalsePositive { /* ... */ },
+    // ...
+    EscalationProposed { /* ... */ },
+    EscalationTransitioned { /* ... */ },
+    // ...
+    CoverageUpdated { /* ... */ },
 }
 ```
 
@@ -50,7 +51,7 @@ pub enum RunEvent {
 
 Every event carries:
 
-- `event_id: RunEventId` — unique, sequential identifier
+- `event_id: RunEventId` — unique identifier
 - `run_id: RunId` — parent run
 - `timestamp: DateTime<Utc>` — when the event was written
 - `authorization_id: Uuid` — links to the `ScopeContract` under which this action was authorized
@@ -66,19 +67,63 @@ pub enum VersionedRunEvent {
     // Future versions...
 }
 
+// Sealed migration trait for type-safe version chains
+mod sealed {
+    pub trait Sealed {}
+}
+
+pub trait Migrate: sealed::Sealed {
+    type Next: Migrate;
+    fn migrate(self) -> Self::Next;
+}
+
+// Marker trait for the latest version (terminates recursion)
+pub trait IsLatest: sealed::Sealed {}
+
+impl sealed::Sealed for RunEventV1 {}
+impl sealed::Sealed for RunEventV2 {}
+
+impl Migrate for RunEventV1 {
+    type Next = RunEventV2;
+    fn migrate(self) -> RunEventV2 {
+        // V1 → V2: adds CoverageUpdated, renames EscalationApproved
+        RunEventV2 {
+            id: self.id,
+            run_id: self.run_id,
+            timestamp: self.timestamp,
+            payload: match self.payload {
+                PayloadV1::EscalationApproved => PayloadV2::EscalationTransitioned,
+                PayloadV1::Other(x) => PayloadV2::Other(x),
+            },
+        }
+    }
+}
+
+impl IsLatest for RunEventV2 {}
+
+impl Migrate for RunEventV2 {
+    type Next = Self;  // Latest version migrates to itself (identity)
+    fn migrate(self) -> Self { self }
+}
+
 impl VersionedRunEvent {
     pub fn migrate_to_latest(self) -> RunEvent {
         match self {
-            Self::V1(v1) => v1.migrate_to_v2().migrate_to_latest(),
+            Self::V1(v1) => Self::V2(v1.migrate()).migrate_to_latest(),
             Self::V2(v2) => v2.into(),
         }
     }
 }
 ```
 
-**Migration chain:**
-- V1 → V2 adds `CoverageUpdated` events and renames `EscalationApproved` → `EscalationTransitioned`
-- V2 → V3 (future) will add distributed tracing spans to all events
+**Migration chain (example):**
+- V1 → V2 adds `CoverageUpdated` events and renames `EscalationApproved` → `EscalationTransitioned`.
+- V2 → V3 (future) may add additional metadata such as tracing spans.
+
+**Trait benefits:**
+- Adding V3 requires implementing `Migrate` for V2, updating the `IsLatest` impl, and adding a new match arm — the compiler enforces completeness
+- The sealed trait prevents external types from entering the migration chain
+- Snapshot tests validate the full chain for each version (see [testing.md](./testing.md))
 
 **Invariants:**
 - Event IDs are stable across migrations
@@ -93,15 +138,28 @@ impl VersionedRunEvent {
 
 ```rust
 pub struct ScopeContract {
-    pub authorization_id: Uuid,
-    pub allowed_targets: BTreeSet<IpNet>,          // CIDR ranges or single IPs
-    pub allowed_domains: BTreeSet<String>,         // Domain names (exact match or suffix)
-    pub allowed_protocols: BTreeSet<Protocol>,     // TCP, UDP, HTTP, etc.
-    pub allowed_tool_families: BTreeSet<ToolFamily>,
-    pub disallowed_operations: BTreeSet<Operation>, // e.g., "destructive_write", "lateral_movement"
-    pub valid_from: DateTime<Utc>,
-    pub valid_until: DateTime<Utc>,
-    pub operator: String,                          // Who authorized this
+    authorization_id: Uuid,                        // Private fields - use accessors
+    allowed_targets: BTreeSet<IpNet>,              // CIDR ranges or single IPs
+    allowed_domains: Vec<String>,                  // Domain names (validated via label-sequence)
+    allowed_protocols: BTreeSet<Protocol>,         // TCP, UDP, HTTP, etc.
+    allowed_tool_families: BTreeSet<ToolFamily>,
+    disallowed_operations: BTreeSet<Operation>,    // e.g., "destructive_write", "lateral_movement"
+    valid_from: DateTime<Utc>,
+    valid_until: DateTime<Utc>,
+    operator: String,                              // Who authorized this
+}
+
+impl ScopeContract {
+    // Read-only accessors (enforces encapsulation)
+    pub fn authorization_id(&self) -> Uuid { self.authorization_id }
+    pub fn allowed_targets(&self) -> &BTreeSet<IpNet> { &self.allowed_targets }
+    pub fn allowed_domains(&self) -> &[String] { &self.allowed_domains }
+    pub fn allowed_protocols(&self) -> &BTreeSet<Protocol> { &self.allowed_protocols }
+    pub fn allowed_tool_families(&self) -> &BTreeSet<ToolFamily> { &self.allowed_tool_families }
+    pub fn disallowed_operations(&self) -> &BTreeSet<Operation> { &self.disallowed_operations }
+    pub fn valid_from(&self) -> DateTime<Utc> { self.valid_from }
+    pub fn valid_until(&self) -> DateTime<Utc> { self.valid_until }
+    pub fn operator(&self) -> &str { &self.operator }
 }
 ```
 
@@ -111,24 +169,98 @@ Every planning decision (e.g., "dispatch this probe") evaluates the `ScopeContra
 
 ```rust
 impl ScopeContract {
-    pub fn allows_probe<P, const V: u32>(&self, probe: &ProbeSpec<P, V>) -> Result<(), PolicyViolation>
+    /// Validates a probe against this scope contract at a specific point in time.
+    /// 
+    /// # Arguments
+    /// * `probe` - The validated probe specification to check
+    /// * `at` - The timestamp to check the time window against (prevents TOCTOU)
+    /// 
+    /// # Returns
+    /// * `Ok(())` if the probe is authorized
+    /// * `Err(PolicyViolation)` if the probe violates this contract
+    /// 
+    /// # Security
+    /// - Accepts explicit `at` timestamp to prevent time-of-check/time-of-use races
+    /// - Only accepts `Validated` probes (enforced at type level via State phantom)
+    /// - Uses label-sequence domain validation to prevent subdomain bypass attacks
+    pub fn allows_probe<P, const V: u32, S>(
+        &self, 
+        probe: &ProbeSpec<P, V, S>, 
+        at: DateTime<Utc>
+    ) -> Result<(), PolicyViolation>
     where
         P: VulnerabilityClass,
+        S: ValidatedState,
     {
         self.validate_target(&probe.target)?;
         self.validate_protocol(&probe.protocol)?;
         self.validate_tool_family(&probe.tool_family)?;
-        self.validate_time_window()?;
+        self.validate_time_window(at)?;  // Now uses explicit timestamp
         self.validate_no_disallowed_ops(&probe.operations)?;
         Ok(())
+    }
+
+    fn validate_time_window(&self, at: DateTime<Utc>) -> Result<(), PolicyViolation> {
+        if at < self.valid_from || at > self.valid_until {
+            return Err(PolicyViolation::OutsideTimeWindow);
+        }
+        Ok(())
+    }
+
+    fn validate_target(&self, target: &TargetSpec) -> Result<(), PolicyViolation> {
+        match target {
+            TargetSpec::Ip(ip) => {
+                if !self.allowed_targets.iter().any(|net| net.contains(ip)) {
+                    return Err(PolicyViolation::UnauthorizedTarget);
+                }
+            }
+            TargetSpec::Domain(domain) => {
+                // Proper domain validation using label-sequence comparison
+                // Prevents "evil-example.com" from matching "example.com"
+                if !self.is_domain_allowed(domain) {
+                    return Err(PolicyViolation::UnauthorizedTarget);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Validates domain membership using label-sequence comparison.
+    /// 
+    /// # Security
+    /// Prevents subdomain bypass attacks where "evil-example.com" would
+    /// match "example.com" with naive `ends_with` checking.
+    /// 
+    /// # Algorithm
+    /// Splits both the target domain and allowed patterns on '.' and compares
+    /// label sequences from right to left (TLD first).
+    fn is_domain_allowed(&self, domain: &str) -> bool {
+        let domain_labels: Vec<&str> = domain.split('.').collect();
+        
+        for allowed in &self.allowed_domains {
+            let allowed_labels: Vec<&str> = allowed.split('.').collect();
+            
+            // Domain must have at least as many labels as the allowed pattern
+            if domain_labels.len() < allowed_labels.len() {
+                continue;
+            }
+            
+            // Compare labels from the end (TLD first)
+            let offset = domain_labels.len() - allowed_labels.len();
+            if domain_labels[offset..] == allowed_labels[..] {
+                return true;
+            }
+        }
+        
+        false
     }
 }
 ```
 
 **Fail-closed semantics:**
-- If `allows_probe` returns `Err`, the probe is **never dispatched**
-- Policy violations log a `ProbeAborted` event but never send the probe to the execution plane
-- Control-plane code cannot bypass this check (no `Clone` on `ScopeContract`)
+- If `allows_probe` returns `Err`, the probe is **never dispatched**.
+- Policy violations log an abort event but never send the probe to the execution plane.
+- Control-plane code should always go through this API; `ScopeContract` itself is not `Clone` to discourage ad hoc copies.
 
 ### Construction
 
@@ -147,7 +279,7 @@ let scope = ScopeContractBuilder::new()
     .build()?; // Fails if any required field is missing
 ```
 
-**Invariant:** Missing `allowed_targets` is a **hard startup failure**. There is no "empty = allow all" default.
+**Invariant:** Missing `allowed_targets` is a **hard failure**. There is no "empty = allow all" default.
 
 **See:** [security.md](./security.md) for governance and audit model.
 
@@ -162,7 +294,22 @@ A typed request to execute a specific security tool. Encodes:
 ### Structure
 
 ```rust
-pub struct ProbeSpec<P: VulnerabilityClass, const V: u32> {
+// Sealed validation state markers (typestate pattern)
+mod sealed {
+    pub trait Sealed {}
+    pub struct Unvalidated;
+    pub struct Validated;
+    impl Sealed for Unvalidated {}
+    impl Sealed for Validated {}
+}
+
+pub trait ValidationState: sealed::Sealed {}
+impl ValidationState for sealed::Unvalidated {}
+impl ValidationState for sealed::Validated {}
+
+pub use sealed::{Unvalidated, Validated};
+
+pub struct ProbeSpec<P: VulnerabilityClass, const V: u32, S: ValidationState = Unvalidated> {
     pub probe_id: ProbeId,
     pub target: Target,
     pub protocol: Protocol,
@@ -171,7 +318,35 @@ pub struct ProbeSpec<P: VulnerabilityClass, const V: u32> {
     pub preconditions: Vec<RunEventId>,        // Events that must exist before this probe runs
     pub expected_evidence: Vec<EvidenceType>,
     pub timeout: Duration,
-    _phantom: PhantomData<P>,
+    _phantom: PhantomData<(P, S)>,
+}
+
+impl<P: VulnerabilityClass, const V: u32> ProbeSpec<P, V, Unvalidated> {
+    /// Validates this probe against a scope contract, consuming the unvalidated
+    /// probe and returning a validated one.
+    /// 
+    /// # Type Safety
+    /// This is the ONLY way to construct a `ProbeSpec<P, V, Validated>`.
+    /// The executor boundary only accepts validated probes.
+    pub fn validate(
+        self, 
+        scope: &ScopeContract,
+        at: DateTime<Utc>
+    ) -> Result<ProbeSpec<P, V, Validated>, PolicyViolation> {
+        scope.allows_probe(&self, at)?;
+        
+        Ok(ProbeSpec {
+            probe_id: self.probe_id,
+            target: self.target,
+            protocol: self.protocol,
+            tool_family: self.tool_family,
+            parameters: self.parameters,
+            preconditions: self.preconditions,
+            expected_evidence: self.expected_evidence,
+            timeout: self.timeout,
+            _phantom: PhantomData,
+        })
+    }
 }
 ```
 
@@ -261,11 +436,12 @@ pub struct EvidenceArtifact {
     pub captured_at: DateTime<Utc>,
 }
 
+/// Shape only; actual storage uses a streaming RawOutput type.
 pub enum ArtifactContent {
-    CommandOutput { stdout: Vec<u8>, stderr: Vec<u8>, exit_code: i32 },
-    ParsedVulnerability { cve: Option<String>, description: String, proof: Vec<u8> },
-    HttpTransaction { request: Vec<u8>, response: Vec<u8>, timing_ms: u64 },
-    FileSample { path: String, mime_type: String, content: Vec<u8> },
+    CommandOutput { stdout: RawOutput, stderr: RawOutput, exit_code: i32 },
+    ParsedVulnerability { cve: Option<String>, description: String, proof: RawOutput },
+    HttpTransaction { request: RawOutput, response: RawOutput, timing_ms: u64 },
+    FileSample { path: String, mime_type: String, content: RawOutput },
 }
 ```
 
@@ -281,29 +457,9 @@ Artifacts are ingested via streaming with strict size limits:
 
 ### Evidence Graph
 
-Artifacts link to their source events, creating a directed acyclic graph (DAG):
+Artifacts link to their source events, creating a directed acyclic graph (DAG) of goals, probes, findings, and remediation steps.
 
-```
-RunInitiated
-    ↓
-TargetDiscovered
-    ↓
-ProbeDispatched (port scan)
-    ↓
-ProbeCompleted (evidence: open ports)
-    ↓
-FindingConfirmed (SSH on port 22)
-    ↓
-EscalationProposed (try weak credentials)
-    ↓
-ProbeDispatched (SSH brute-force)
-    ↓
-ProbeCompleted (evidence: auth success)
-    ↓
-FindingConfirmed (compromised account)
-```
-
-**Query:** "Show me all evidence for finding X" walks the graph backward from `FindingConfirmed` to `ProbeCompleted` to `EvidenceArtifact`.
+**Example query:** "Show me all evidence for finding X" walks the graph backward from `FindingConfirmed` through `ProbeCompleted` to the associated `EvidenceArtifact`s.
 
 ## CoverageMap
 
@@ -326,28 +482,17 @@ pub struct CoverageDelta {
 }
 ```
 
-### Example
+### Usage
 
-After a full port scan of `192.168.1.0/24`:
+The planner and UI use `CoverageMap` to drive:
 
-```rust
-CoverageUpdated {
-    dimension: CoverageDimension::PortRange { start: 1, end: 65535 },
-    delta: CoverageDelta {
-        dimension: CoverageDimension::SubnetRange { cidr: "192.168.1.0/24".parse()? },
-        coverage_before: 0.0,
-        coverage_after: 1.0,
-    },
-}
-```
-
-**UI rendering:** Coverage map visualizes tested vs untested regions. Red = untested, yellow = partial, green = full coverage.
+- Target selection and coverage-aware replanning.
+- Stopping conditions based on diminishing returns.
+- Visual coverage maps (e.g., red = untested, yellow = partial, green = full).
 
 ## Retry and Escalation
 
 ### Retry Policy
-
-Transient errors (network timeout, resource exhaustion) trigger automatic retry with exponential backoff:
 
 ```rust
 pub struct RetryPolicy {
@@ -356,11 +501,12 @@ pub struct RetryPolicy {
     pub max_delay: Duration,
     pub backoff_factor: f64,
 }
-
-// Default: 3 attempts, 1s initial delay, 30s max delay, 2x backoff
 ```
 
-**Permanent errors** (policy violation, malformed tool output) fail immediately without retry.
+**Semantics:**
+
+- Transient errors (network timeout, temporary resource exhaustion) may be retried with exponential backoff.
+- Permanent errors (policy violation, malformed tool output) fail immediately without retry.
 
 ### Escalation Typestate
 
@@ -375,12 +521,11 @@ pub enum EscalationState {
 }
 ```
 
-**Transition rules:**
-- `Proposed → Approved`: Mentor writes `EscalationTransitioned` event
-- `Proposed → Disputed`: Mentor writes `EscalationTransitioned` event with `reason`
-- `Approved → Superseded`: Newer escalation invalidates older one (tracked via `supersedes: Option<RunEventId>`)
+**Transition rules (high level):**
+- `Proposed → Approved` or `Proposed → Disputed` via review events.
+- `Approved → Superseded` when a newer escalation replaces it.
 
-**Invariant:** Only `Approved` escalations can dispatch probes. The executor checks escalation state before spawning sandboxes.
+**Invariant:** Only `Approved` escalations can dispatch probes; the executor must check escalation state before spawning sandboxes.
 
 ## Crate Layout
 
@@ -399,7 +544,7 @@ agents-core/
 └── validated.rs          (Typestate markers: Unvalidated, Validated)
 ```
 
-**Shared types:** `RunEventId`, `RunId`, `ProbeId`, `ArtifactId`, `Target`, `Protocol`, `ToolFamily`, `Severity` are all defined in `agents-core` to avoid circular dependencies.
+**Shared types:** `RunEventId`, `RunId`, `ProbeId`, `ArtifactId`, `Target`, `Protocol`, `ToolFamily`, and `Severity` are defined in `agents-core` to avoid circular dependencies.
 
 ## Further Reading
 

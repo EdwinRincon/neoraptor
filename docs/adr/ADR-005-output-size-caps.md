@@ -85,6 +85,53 @@ impl Executor {
     }
 }
 ```
+**Memory efficiency improvements:**
+
+1. **Pre-allocation**: Use `Vec::with_capacity(cap_bytes)` (maximum buffer size in bytes) instead of `Vec::new()` to avoid growth reallocations during chunk ingestion  
+2. **Ref-counted storage**: Replace `content: Vec<u8>` with `content: Bytes` (from the `bytes` crate) to enable O(1) ref-counted cloning across actors without duplicating payloads (immutable, shared buffer)  
+3. **Event delegation**: Return `Result<IngestResult, _>` where `IngestResult` contains both the artifact and a `Vec<RunEvent>` of deferred events; the caller is responsible for emitting them, ensuring they are not dropped under event-store backpressure  
+
+**Updated implementation:**
+
+```rust
+use bytes::Bytes;
+
+struct IngestResult {
+    artifact: EvidenceArtifact,
+    deferred_events: Vec<RunEvent>, // Caller must emit these
+}
+
+// Replace line:
+// let mut buffer = Vec::new();
+// With:
+let mut buffer = Vec::with_capacity(cap_bytes);
+
+// Replace lines (emit_event call)
+// With:
+let mut deferred_events = Vec::new();
+if truncated {
+    deferred_events.push(RunEvent::ArtifactTruncated {
+        size_bytes: total_bytes,
+        cap_bytes,
+    });
+}
+
+// Replace return type and value:
+Ok(IngestResult {
+    artifact: EvidenceArtifact {
+        content: Bytes::from(buffer), // Single move into Bytes; no further copies, cheap clones after
+        size_bytes: total_bytes,
+        truncated,
+    },
+    deferred_events,
+})
+```
+
+**Rationale:**
+
+- Pre-allocation avoids growth reallocations when ingesting large streams (e.g., ~10 MB)  
+- `Bytes` provides immutable, shared storage with O(1) cloning across actors (e.g., analyzer, archiver)  
+- Returning deferred events ensures truncation signals are not dropped due to emitter backpressure; the caller controls emission and retry semantics
 
 **Configurable caps:**
 

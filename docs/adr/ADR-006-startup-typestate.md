@@ -102,6 +102,72 @@ async fn panic_log_sink_outlives_actors() {
 }
 ```
 
+## Drop Guard for Shutdown Ordering
+
+The shutdown ordering contract ("actors drain, then panic_sink flushes") must be enforced even if `.shutdown().await` is bypassed:
+
+```rust
+impl Drop for InfraHandles {
+    fn drop(&mut self) {
+        // If shutdown() was never called, force it now as a last resort
+        if !self.shutdown_called.load(Ordering::SeqCst) {
+            tracing::error!(
+                "InfraHandles dropped without calling shutdown() - forcing shutdown now"
+            );
+            
+            // Block on shutdown in a new thread (can't use async in Drop)
+            std::thread::spawn({
+                let handles = self.clone();  // Requires Arc-wrapped internals
+                move || {
+                    let runtime = tokio::runtime::Runtime::new().unwrap();
+                    runtime.block_on(async {
+                        handles.shutdown_impl().await;
+                    });
+                }
+            }).join().ok();
+        }
+    }
+}
+
+impl InfraHandles {
+    pub async fn shutdown(&self) {
+        self.shutdown_called.store(true, Ordering::SeqCst);
+        self.shutdown_impl().await;
+    }
+
+    async fn shutdown_impl(&self) {
+        // TaskTracker ensures all actors join before dropping panic_sink
+        self.task_tracker.close();
+        self.task_tracker.wait().await;
+        // panic_sink Arc is dropped after all tasks complete
+    }
+}
+```
+
+**Alternative (simpler):** Use a `#[must_use]` shutdown token pattern:
+
+```rust
+pub struct ShutdownToken {
+    handles: Arc<InfraHandles>,
+}
+
+impl ShutdownToken {
+    #[must_use]
+    pub async fn shutdown(self) {
+        self.handles.shutdown_impl().await;
+        // self is consumed - Drop won't run
+    }
+}
+
+impl Drop for ShutdownToken {
+    fn drop(&mut self) {
+        panic!("ShutdownToken dropped without calling .shutdown() - shutdown ordering violated!");
+    }
+}
+```
+
+**Rationale:** Relying on convention (calling `.shutdown()`) is fragile. A `Drop` guard or `#[must_use]` token enforces shutdown ordering at the type level, preventing panic-log loss even if the caller bypasses the shutdown method.
+
 **References:**
 
 - [runtime.md](../runtime.md) — Startup typestate and shutdown ordering

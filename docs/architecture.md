@@ -1,6 +1,6 @@
 # NEORAPTOR Architecture
 
-NEORAPTOR is an autonomous offensive-security control plane built on event-sourced runs and typed tool orchestration. This document provides a high-level overview of the system architecture, core boundaries, and key invariants.
+NEORAPTOR is an autonomous offensive-security control plane built on event-sourced runs, bounded queues with backpressure, and typed tool orchestration. This document provides a high-level overview of the system architecture, core boundaries, and key invariants.
 
 For detailed implementation specifics, see the linked documents below.
 
@@ -20,10 +20,11 @@ NEORAPTOR orchestrates autonomous security testing operations through a strict s
 - **Fail-closed governance**: `ScopeContract` violations abort at planning time, never at execution time.
 - **Typed tool families**: Probe specifications are typed, versioned, and validated — no raw shell generation in the control plane.
 - **Operator-visible reasoning**: Why this tool, why this path, why this finding — all traceable and replayable.
+- **Backpressure and shedding**: Bounded mailboxes and typed priority shedding prevent unbounded growth while preserving critical work.
 
 ## System Structure
 
-NEORAPTOR is organized into two planes:
+NEORAPTOR is organized into two planes.
 
 ### Control Plane (Trusted)
 
@@ -34,6 +35,7 @@ The control plane runs operator-facing services and orchestration logic. It **ne
 - Enforce `ScopeContract` on every state transition
 - Plan typed `ProbeSpec` instances
 - Validate findings and approve escalations
+- Apply bounded-queue backpressure and priority-based shedding
 - Emit events to the append-only event store
 - Serve SSE streams and UI state
 
@@ -43,6 +45,7 @@ The control plane runs operator-facing services and orchestration logic. It **ne
 - `neoraptor-planner`: Typed autonomy loop (planners, validators)
 - `agents-core`: Domain primitives (`RunEvent`, `ScopeContract`, `ProbeSpec`, `EvidenceArtifact`)
 - `neoraptor-event-store`: Append-only event persistence with versioned migrations
+- `error-core`: Shared error types across planes
 
 ### Execution Plane (Sandboxed)
 
@@ -67,7 +70,7 @@ The domain model is defined in `agents-core` and shared across both planes.
 
 ### `RunEvent`
 
-The atomic unit of state. Every action in the system produces a `RunEvent` (e.g., `TargetDiscovered`, `ProbeDispatched`, `FindingConfirmed`, `EscalationTransitioned`). Events are:
+The atomic unit of state. Every action in the system produces a `RunEvent` (for example, `TargetDiscovered`, `ProbeDispatched`, `FindingConfirmed`, `EscalationTransitioned`). Events are:
 
 - Immutable and append-only
 - Linked to a `ScopeContract.authorization_id`
@@ -90,13 +93,13 @@ The cryptographic safety boundary for authorized actions. Defines allowed target
 
 ### `ProbeSpec<P, V>`
 
-A typed request to execute a specific tool (e.g., `PortScanProbe`, `SqlInjectionProbe`). Encodes:
+A typed request to execute a specific tool (for example, `PortScanProbe`, `SqlInjectionProbe`). Encodes:
 
 - Vulnerability class via phantom type `P`
 - Fingerprint schema version via const generic `V`
 - Target, preconditions, tool family, expected evidence
 
-**Why typed?** Cross-version deduplication is a **compile-time type mismatch** rather than a runtime logic error. Planners and validators reason about probes before execution and after return, enabling "why this probe" traceability.
+**Why typed?** Cross-version deduplication becomes a compile-time type mismatch rather than a runtime logic error, and planners and validators can reason about probes before execution and after return for “why this probe” traceability.
 
 **See:** [domain-model.md](./domain-model.md) for `ProbeSpec` typestate and fingerprint versioning.
 
@@ -106,7 +109,9 @@ Structured evidence from tool execution: command output, parsed vulnerabilities,
 
 - Source `RunEvent`
 - Tool family and version
-- Size caps enforced via streaming ingestion
+- Size and truncation metadata
+- Streaming ingestion path (never assuming full unbounded buffering)
+
 
 **See:** [domain-model.md](./domain-model.md) for artifact lifecycle and evidence graph modeling.
 
@@ -115,61 +120,83 @@ Structured evidence from tool execution: command output, parsed vulnerabilities,
 These constraints must always hold and are enforced at compile time or startup:
 
 1. **Control plane never executes tools directly.** Tool execution happens only in the execution plane via `neoraptor-executor` actors.
-
 2. **Execution plane cannot mutate governance state.** Only the control plane writes events; sandboxes return output via bounded streams.
-
-3. **Event log is append-only.** No deletes, no in-place updates. Schema changes use versioned migrations.
-
+3. **Event log is append-only.** No deletes, no in-place updates. Schema changes use versioned migrations and `VersionedRunEvent` envelopes.
 4. **ScopeContract violations fail closed.** Planning aborts before dispatch; execution-plane output violating scope is logged but not acted upon.
-
 5. **Typed probes prevent cross-version fingerprint collisions.** `ProbeSpec<P, const V: u32>` ensures deduplicator type mismatches across schema versions.
-
-6. **Output caps are non-negotiable.** 10 MB per artifact, 100 MB per run (configurable). Exceeded caps trigger truncation + warning events.
-
-7. **Panic-log sink outlives all actors.** Shutdown ordering ensures panics are never lost (see [runtime.md](./runtime.md)).
-
-8. **Startup invariants are enforced via typestate builder.** Runtime code runs with all invariants pre-validated (see [runtime.md](./runtime.md)).
+6. **Output caps are non-negotiable.** 10 MB per artifact, 100 MB per run (configurable). Exceeded caps trigger truncation and warning events.
+7. **Panic-log sink outlives all actors.** Shutdown ordering ensures panics are never lost (see `runtime.md` for supervisor and logging actor lifetimes).
+8. **Startup invariants are enforced via typestate builder.** Runtime code runs with all invariants pre-validated (see `runtime.md`).
+9. **Bounded queues with typed shedding.** All actor mailboxes are bounded, and priority-based eviction preserves critical work under load (ADR-004).
+10. **Snapshots bound replay cost.** Snapshot strategy ensures restart cost is \(O(\text{events since last snapshot})\), not \(O(\text{all events})\) (ADR-001).
 
 ## Workflow: End-to-End Run
 
 A typical NEORAPTOR run follows this flow:
 
-1. **Operator submits intent** via API (`POST /runs` with scope + targets)
-2. **Control plane validates scope** → constructs `ScopeContract` → writes `RunInitiated` event
-3. **Planner generates typed probes** → emits `ProbeDispatched` events
-4. **Executor receives probes** → spawns sandboxes → streams tool output
-5. **Validator confirms findings** → writes `FindingConfirmed` or `FalsePositive` events
-6. **ChainPlanner synthesizes attack chains** → proposes escalations
-7. **Mentor reviews escalations** → approves or disputes → writes `EscalationTransitioned`
-8. **Supervisor monitors actors** → handles panics → coordinates shutdown
-9. **UI polls event stream** → renders coverage map + attack paths
+1. Operator submits intent via API (`POST /runs` with scope and targets).
+2. Control plane validates scope, constructs `ScopeContract`, writes `RunInitiated`.
+3. Planner generates typed probes and emits `ProbeDispatched` events.
+4. Executor receives probes, spawns sandboxes, and streams tool output with caps.
+5. Validator confirms findings and writes `FindingConfirmed` or `FalsePositive`.
+6. ChainPlanner synthesizes attack chains and proposes escalations.
+7. Mentor reviews escalations, approves or disputes, writes `EscalationTransitioned`.
+8. Supervisor monitors actors, handles panics, coordinates shutdown.
+9. UI consumes event streams and renders coverage maps and attack paths.
 
 **See:** [runtime.md](./runtime.md) for actor roles, backpressure strategy, and supervision.
 
 ## Crate Map
 
-```
+```text
 crates/
 ├── api/                  (HTTP, SSE, startup wiring)
 ├── orchestrator/         (Flow lifecycle, policy enforcement)
 ├── planner/              (Typed autonomy loop)
 ├── executor/             (Sandbox lifecycle)
-├── agents-core/          (Core primitives: RunEvent, ScopeContract, ProbeSpec, Evidence)
+├── agents-core/          (Core primitives: RunEvent, ScopeContract, ProbeSpec, EvidenceArtifact)
 ├── event-store/          (Append-only persistence with versioned migrations)
 ├── sandbox/              (Isolation primitives)
 ├── tools/                (Typed tool family definitions)
+├── error-core/           (Shared error types and conversions)
 └── ui/                   (Coverage map, event stream viewer)
 ```
 
-**See:** [domain-model.md](./domain-model.md) for agents-core internals.
+**See:** [domain-model.md](./domain-model.md) for `agents-core` internals.
 
 ## Error Handling
 
-Cross-cutting error types (I/O, sandbox, policy) are shared via `error-core` using `thiserror` + `From` conversions. `anyhow` usage is confined to `api/` composition and HTTP boundary.
+Cross-cutting error types (I/O, sandbox, policy) are shared via `error-core` using `thiserror` + `From` conversions. `anyhow` usage is confined to `api/` composition and HTTP boundaries.
 
-**Policy:** Errors are categorized as:
+**Control plane–execution plane boundary:**
+
+```rust
+#[derive(Debug, thiserror::Error)]
+pub enum ExecutorError {
+    #[error("Policy violation: {0}")]
+    PolicyViolation(PolicyViolation),
+
+    #[error("Resource exhausted: {resource}")]
+    ResourceExhausted { resource: String },
+
+    #[error("Timeout after {elapsed:?}")]
+    Timeout { elapsed: Duration },
+
+    #[error("Sandbox failure: {0}")]
+    SandboxFailure(String),
+
+    #[error("I/O error: {0}")]
+    Io(#[from] std::io::Error),
+}
+
+type ExecutorResult = Result<EvidenceArtifact, ExecutorError>;
+```
+
+The concrete `ExecutorError` enum preserves pattern-matching capability for policy violations, resource exhaustion, and timeouts across IPC boundaries.
+
+**Policy:**
 - **Transient** (network, resource): retry with exponential backoff
-- **Permanent** (validation, policy): fail immediately, log, emit `ProbeFailed` event
+- **Permanent** (validation, policy): fail immediately, log, emit `ProbeFailed`
 - **Panic** (logic bug): captured by supervisor, logged, escalated to operator
 
 **See:** [runtime.md](./runtime.md) for panic handling and escalation typestate.
@@ -178,10 +205,10 @@ Cross-cutting error types (I/O, sandbox, policy) are shared via `error-core` usi
 
 NEORAPTOR emits:
 
-- **Metrics**: probe dispatch rate, finding confirmation rate, sandbox spawn latency, queue depth
-- **Traces**: distributed tracing for run → probe → finding lineage
-- **Logs**: structured JSON logs with run/probe/actor IDs
-- **Events**: all state changes are captured as `RunEvent` in the event log
+- Metrics: probe dispatch rate, finding confirmation rate, sandbox spawn latency, queue depth
+- Traces: distributed tracing for run → probe → finding lineage
+- Logs: structured JSON logs with run, probe, and actor IDs
+- Events: all state changes captured as `RunEvent` in the event log
 
 **See:** [observability.md](./observability.md) for metrics catalog and degradation signals.
 
@@ -195,16 +222,16 @@ NEORAPTOR emits:
 **Enforcement points:**
 - `ScopeContract` validation before every planning decision
 - Output size caps on all sandbox streams
-- Schema validation on all external inputs (API, tool output)
+- Schema and size validation on all external inputs (API, tool output) before event append
 
 **See:** [security.md](./security.md) for sandbox guarantees and audit model.
 
 ## Testing Strategy
 
-- **Unit tests**: Domain logic, typestate transitions, error paths
-- **Integration tests**: Event replay across version boundaries, actor supervision
-- **Macro snapshot tests**: Trait-variant macro stability (see [testing.md](./testing.md))
-- **CI**: Rust check, clippy, deny, test on every commit
+- Unit tests: domain logic, typestate transitions, error paths
+- Integration tests: event replay across version boundaries, actor supervision
+- Macro snapshot tests: trait-variant macro stability (see [testing.md](./testing.md))
+- CI: `cargo check`, `clippy`, `deny`, and `test` on every commit
 
 **See:** [testing.md](./testing.md) for test layout and CI entrypoints.
 
@@ -212,7 +239,7 @@ NEORAPTOR emits:
 
 - [domain-model.md](./domain-model.md) — Deep dive on `RunEvent`, `ScopeContract`, `ProbeSpec`, evidence graph
 - [runtime.md](./runtime.md) — Actor roles, backpressure, supervision, shutdown ordering
-- [security.md](./security.md) — ScopeContract enforcement, sandbox guarantees, governance
+- [security.md](./security.md) — `ScopeContract` enforcement, sandbox guarantees, governance
 - [observability.md](./observability.md) — Metrics, traces, coverage signals, heap health
 - [testing.md](./testing.md) — Testing strategy, macro stability, CI layout
 - [adr/](./adr/) — Architecture decision records for major design choices
@@ -221,6 +248,6 @@ NEORAPTOR emits:
 
 **v0.1.0** is intentionally limited to one end-to-end vertical slice:
 
-API → typed intent → sandboxed tool execution → event log/artifacts → minimal UI/audit
+API → typed intent → sandboxed tool execution → event log and artifacts → minimal UI and audit
 
 Firecracker, graph projections, advanced chain planning, and full OTEL/Langfuse support remain v0.2+. The initial implementation validates trust boundaries, backpressure, output caps, retry policy, shutdown behavior, and schema evolution before expanding scope.

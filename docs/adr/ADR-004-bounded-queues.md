@@ -49,9 +49,104 @@ Use **bounded queues** for all actor mailboxes with explicit **shedding rules** 
 - `Validator`: 500 (moderate finding confirmation rate)
 
 **Shedding rules:**
-1. Drop lowest-priority probes first (informational → low → medium → high → critical)
-2. Cap human-review queue at 50 escalations (oldest `Proposed` auto-disputed)
-3. Throttle new runs if active runs exceed 10 (HTTP 429 response)
+1. Drop lowest-priority probes first (Informational → Low → Medium → High → Critical)
+2. Cap human-review queue at 50 escalations (oldest `Proposed` auto-disputed; see Auto-Dispute section)
+3. Throttle new runs if active runs exceed 10 (HTTP 429)
+
+**Type-level priority enforcement:**
+
+```rust
+// In agents-core/src/lib.rs
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ProbePriority {
+    Informational = 0,
+    Low = 1,
+    Medium = 2,
+    High = 3,
+    Critical = 4,
+}
+
+pub trait Sheddable {
+    fn priority(&self) -> ProbePriority;
+}
+
+// Applied to actor message enums
+pub enum PlannerMessage {
+    ProbeRequest { spec: ProbeSpec<P, V>, priority: ProbePriority },
+    // ...
+}
+
+impl Sheddable for PlannerMessage {
+    fn priority(&self) -> ProbePriority {
+        match self {
+            Self::ProbeRequest { priority, .. } => *priority,
+            // ...
+        }
+    }
+}
+
+// Priority-aware shedding wrapper
+pub struct PriorityShedder<T: Sheddable> {
+    tx: mpsc::Sender<T>,
+    // Min-heap by priority (lowest evicted first)
+    mailbox: Arc<Mutex<BinaryHeap<Reverse<(ProbePriority, u64, T)>>>>,
+    seq: AtomicU64, // tie-breaker for stable ordering
+}
+
+impl<T: Sheddable> PriorityShedder<T> {
+    pub async fn send(&self, msg: T) -> Result<(), SendError<T>> {
+        match self.tx.try_send(msg) {
+            Ok(_) => Ok(()),
+            Err(TrySendError::Full(msg)) => {
+                let mut heap = self.mailbox.lock().await;
+
+                // Compare against lowest priority currently buffered
+                if let Some(Reverse((lowest_priority, _, _))) = heap.peek() {
+                    if msg.priority() > *lowest_priority {
+                        heap.pop(); // evict lowest
+                        // Retry send; still handle potential race
+                        match self.tx.try_send(msg) {
+                            Ok(_) => {
+                                emit_event(BackpressureTriggered {
+                                    actor: "planner",
+                                    evicted_priority: *lowest_priority,
+                                });
+                                Ok(())
+                            }
+                            Err(TrySendError::Full(msg)) => {
+                                // Fallback: enqueue into heap if still full
+                                let seq = self.seq.fetch_add(1, Ordering::Relaxed);
+                                heap.push(Reverse((msg.priority(), seq, msg)));
+                                Ok(())
+                            }
+                            Err(e) => Err(e.into()),
+                        }
+                    } else {
+                        // New message is lowest priority → drop
+                        Ok(())
+                    }
+                } else {
+                    // Heap empty but channel full (race); enqueue
+                    let seq = self.seq.fetch_add(1, Ordering::Relaxed);
+                    heap.push(Reverse((msg.priority(), seq, msg)));
+                    Ok(())
+                }
+            }
+            Err(e) => Err(e.into()),
+        }
+    }
+}
+```
+
+**Rationale:**
+- Without typed priority, `try_send` drops messages arbitrarily; high-priority work can be lost while low-priority work remains queued
+- `Sheddable` + `PriorityShedder` enforces priority-aware eviction consistently
+- Tie-breaker (`seq`) ensures stable ordering among equal priorities
+- Handling the second `try_send` failure avoids races under contention
+
+## Auto-Dispute with Event Emission
+
+Auto-dispute triggered by queue pressure must emit a proper audit event through the Mentor actor:
 
 **Metrics:**
 - `neoraptor_actor_mailbox_depth` (gauge)
@@ -71,6 +166,38 @@ match tx.try_send(msg) {
     }
 }
 ```
+
+```rust
+// In orchestrator/src/supervisor.rs
+
+// WRONG: Silent auto-dispute bypasses audit trail
+if escalation_queue.len() >= 50 {
+    let oldest = escalation_queue.pop_front().unwrap();
+    oldest.status = EscalationStatus::Disputed;  // ❌ No event!
+}
+
+// CORRECT: Auto-dispute through Mentor actor
+if escalation_queue.len() >= 50 {
+    let oldest_id = escalation_queue.front().unwrap().id;
+
+    // Send to Mentor actor, which emits the event
+    mentor_tx.send(MentorMessage::AutoDispute {
+        escalation_id: oldest_id,
+        reason: DisputeReason::AutoDisputedQueuePressure,
+    }).await?;
+
+    // Mentor actor handles:
+    emit_event(EscalationTransitioned {
+        escalation_id: oldest_id,
+        from: EscalationStatus::Proposed,
+        to: EscalationStatus::Disputed,
+        reason: DisputeReason::AutoDisputedQueuePressure,
+        operator: "system".to_string(),
+    });
+}
+```
+
+**Rationale:** Auto-dispute is a governance state mutation that must leave an audit trail. Bypassing the Mentor actor path means the decision is invisible to operators querying the event log, potentially hiding critical RCE → lateral movement chains that were auto-closed under queue pressure.
 
 **References:**
 

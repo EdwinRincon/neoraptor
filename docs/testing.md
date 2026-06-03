@@ -171,10 +171,14 @@ async fn event_replay_v1_to_v2() {
 async fn actor_mailbox_overflow_triggers_backpressure() {
     let (tx, rx) = mpsc::channel(10); // Capacity: 10
 
-    // Send 11 messages (1 over capacity)
-    for i in 0..11 {
-        tx.send(i).await.ok();
+    // Send 10 messages - should succeed
+    for i in 0..10 {
+        tx.send(i).await.unwrap();
     }
+
+    // 11th message should trigger backpressure - use try_send to assert the error
+    let result = tx.try_send(10);
+    assert!(matches!(result, Err(TrySendError::Full(_))));
 
     // Verify backpressure triggered
     let metrics = get_metrics().await;
@@ -313,6 +317,90 @@ fn run_event_serialization_stable() {
 ```
 
 **Rationale:** Event schema changes must be explicit and reviewed. Accidental schema drift breaks event replay.
+
+## Property-Based Testing
+
+Hand-written unit tests miss adversarial inputs and boundary conditions. **Recommendation:** Add property-based tests (using `proptest` or `bolero`) for security-critical validation logic.
+
+### Target: ScopeContract.allows_probe
+
+**Adversarial inputs to cover:**
+- **IPv4-mapped IPv6 addresses** against IPv4 CIDR scopes
+- **Domain strings with null bytes, Unicode homographs, trailing dots**
+- **Time boundaries at ±1 nanosecond** around `valid_from` / `valid_until`
+- **Probe dispatch at exact window edges**
+
+**Example with proptest:**
+
+```rust
+use proptest::prelude::*;
+
+proptest! {
+    #[test]
+    fn scope_rejects_out_of_bounds_timestamps(
+        offset_nanos in -1000i64..1000i64,
+        valid_from in any::<DateTime<Utc>>(),
+    ) {
+        let valid_until = valid_from + Duration::days(1);
+        let scope = ScopeContract {
+            allowed_targets: Default::default(),
+            allowed_domains: vec!["example.com".to_string()],
+            valid_from,
+            valid_until,
+            // ...
+        };
+        
+        // Test at boundary ± offset
+        let at = valid_from + Duration::nanoseconds(offset_nanos);
+        let probe = ProbeSpec::<PortScan, 1, Validated>::new(/* ... */);
+        
+        let result = scope.allows_probe(&probe, at);
+        
+        if offset_nanos < 0 {
+            assert!(matches!(result, Err(PolicyViolation::OutsideTimeWindow)));
+        } else {
+            // Within window
+            assert!(result.is_ok());
+        }
+    }
+
+    #[test]
+    fn domain_validation_resists_subdomain_bypass(
+        domain_labels in prop::collection::vec("[a-z]{1,10}", 1..5),
+        evil_prefix in "[a-z]{1,10}",
+    ) {
+        // allowed: example.com
+        // domain: evil-example.com (should NOT match)
+        let allowed_domain = domain_labels.join(".");
+        let evil_domain = format!("{}-{}", evil_prefix, allowed_domain);
+        
+        let scope = ScopeContract {
+            allowed_domains: vec![allowed_domain.clone()],
+            // ...
+        };
+        
+        let probe = ProbeSpec {
+            target: TargetSpec::Domain(evil_domain),
+            // ...
+        };
+        
+        let result = scope.allows_probe(&probe, Utc::now());
+        assert!(matches!(result, Err(PolicyViolation::UnauthorizedTarget)));
+    }
+}
+```
+
+**Coverage targets:**
+- IPv4/IPv6 edge cases (mapped addresses, link-local, multicast)
+- Time boundary nanosecond precision
+- Domain label edge cases (empty labels, numeric TLDs, internationalized domains)
+- CIDR containment edge cases (host bits set, /0 and /32 masks)
+
+**Integration:** Run property tests in CI with `PROPTEST_CASES=10000` to catch rare edge cases. Failures shrink to minimal reproducers.
+
+**See:** [proptest documentation](https://docs.rs/proptest/) for strategy combinators and shrinking behavior.
+
+---
 
 ## CI Layout
 

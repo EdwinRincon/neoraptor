@@ -153,6 +153,43 @@ let scope = ScopeContractBuilder::new()
 
 **Invariant:** Missing `allowed_targets` is a **hard startup failure**. There is no "empty = allow all" default.
 
+### Performance Optimization: CIDR Lookup
+
+The current `BTreeSet<IpNet>` implementation performs O(n) lookups via `.iter().any(|net| net.contains(&ip))`. With large scopes (thousands of CIDRs) and high probe dispatch rates, this becomes a hot-path bottleneck.
+
+**Recommended alternatives:**
+
+1. **Sorted Vec with binary search:** Replace `BTreeSet<IpNet>` with `Vec<IpNet>` sorted by prefix length and network address. Use binary search on prefix ranges for O(log n) lookups.
+
+2. **CIDR Trie (Radix Tree):** Use a CIDR trie for O(prefix-length) lookups, e.g., `ip_network_table` crate. Optimal for very large scope sets (10k+ CIDRs).
+
+```rust
+// Option 1: Sorted Vec approach
+pub struct ScopeContract {
+    allowed_targets: Vec<IpNet>,  // Sorted by prefix length, then network
+    // ...
+}
+
+impl ScopeContract {
+    fn is_ip_allowed(&self, ip: &IpAddr) -> bool {
+        // Binary search on sorted CIDR ranges
+        self.allowed_targets
+            .binary_search_by(|net| {
+                if net.contains(ip) {
+                    Ordering::Equal
+                } else if *ip < net.network() {
+                    Ordering::Greater
+                } else {
+                    Ordering::Less
+                }
+            })
+            .is_ok()
+    }
+}
+```
+
+**Trade-off:** Complexity vs. performance. Start with BTreeSet for v0.1 (correctness first), benchmark under realistic workload (1k+ CIDRs, 100+ probes/sec), and optimize if profiling shows it as a bottleneck.
+
 **Rationale:** Fail-closed governance prevents accidental over-scoping. An empty scope is a configuration error, not a wildcard.
 
 ## Sandbox Guarantees

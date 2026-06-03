@@ -68,6 +68,62 @@ scope.allows_probe(&probe)?; // ERROR: UnauthorizedTarget
 - Fail-closed semantics prevent accidental over-scoping
 - Operators must explicitly add targets to `allowed_targets` (no wildcards)
 - Time windows (`valid_from`, `valid_until`) enforce temporal scoping
+- **Typestate pattern**: `ScopeContractBuilder` enforces required fields at compile time
+
+**Typestate enforcement (aligned with ADR-006):**
+
+```rust
+// State markers (sealed)
+pub struct NoTargets;
+pub struct HasTargets;
+
+pub struct ScopeContractBuilder<State> {
+    authorization_id: Uuid,
+    allowed_targets: Option<BTreeSet<IpNet>>,
+    // ...
+    _state: PhantomData<State>,
+}
+
+impl ScopeContractBuilder<NoTargets> {
+    pub fn new(authorization_id: Uuid) -> Self {
+        ScopeContractBuilder {
+            authorization_id,
+            allowed_targets: None,
+            _state: PhantomData,
+        }
+    }
+
+    pub fn allowed_targets(mut self, targets: BTreeSet<IpNet>) -> ScopeContractBuilder<HasTargets> {
+        ScopeContractBuilder {
+            authorization_id: self.authorization_id,
+            allowed_targets: Some(targets),
+            _state: PhantomData,
+        }
+    }
+    
+    // No build() method on NoTargets state!
+}
+
+impl ScopeContractBuilder<HasTargets> {
+    pub fn build(self) -> ScopeContract {
+        ScopeContract {
+            authorization_id: self.authorization_id,
+            allowed_targets: self.allowed_targets.unwrap(),  // Safe - HasTargets guarantees Some
+            // ...
+        }
+    }
+}
+
+// Compile-time enforcement:
+let scope = ScopeContractBuilder::new(uuid)
+    .build(); // ❌ ERROR: no method `build` for ScopeContractBuilder<NoTargets>
+
+let scope = ScopeContractBuilder::new(uuid)
+    .allowed_targets(targets)
+    .build(); // ✅ OK: HasTargets state has build()
+```
+
+**Rationale:** This aligns `ScopeContractBuilder` with the same typestate pattern used in `InfraHandlesBuilder` (ADR-006). For an offensive-security control plane, the governance boundary deserves compile-time guarantees, not runtime `Result` checks.
 
 **References:**
 

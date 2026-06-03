@@ -42,6 +42,25 @@ pub struct ProbeDeduplicator<P: VulnerabilityClass, const V: u32> {
 - **Explicit versioning**: Schema version is part of the type signature
 - **Zero-cost abstraction**: Phantom types and const generics have no runtime overhead
 - **Migration path**: V1 → V2 requires explicitly creating new `ProbeSpec<P, 2>` instances
+- **Fingerprint type safety**: `Hash + Eq` supertraits enforce hashability at trait impl site
+
+**Trait definition:**
+
+```rust
+use std::hash::Hash;
+
+pub trait VulnerabilityClass {
+    /// Fingerprint type for deduplication. Must implement Hash + Eq.
+    /// 
+    /// # Compile-time enforcement
+    /// The Hash + Eq supertraits ensure that any type used as a Fingerprint
+    /// is hashable. This catches errors at the trait impl site, not at the
+    /// ProbeDeduplicator instantiation site (which may be in macro-generated code).
+    type Fingerprint: Hash + Eq;
+}
+```
+
+**Rationale:** Without `Hash + Eq` supertraits, a `VulnerabilityClass` implementor could define `type Fingerprint = SomeCustomStruct` without deriving `Hash`, causing errors at deduplicator instantiation time (potentially inside generated macro code) rather than at the trait impl site.
 
 **Negative:**
 - **Type complexity**: `ProbeSpec<PortScanProbe, 1>` vs `ProbeSpec<PortScanProbe, 2>` are different types

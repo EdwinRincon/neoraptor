@@ -101,7 +101,9 @@ NEORAPTOR exposes Prometheus-compatible metrics at `/metrics`.
 |--------|------|-------------|
 | `neoraptor_heap_size_bytes` | Gauge | Total heap size |
 | `neoraptor_heap_growth_rate_bytes_per_sec` | Gauge | Rate of heap growth |
-| `neoraptor_heap_gc_duration_seconds` | Histogram | GC pause duration (Rust allocator stats) |
+| `neoraptor_heap_allocated_bytes` | Gauge     | Total heap allocated bytes (jemalloc stats.allocated) |
+| `neoraptor_heap_active_bytes`     | Gauge     | Active heap bytes (jemalloc stats.active)              |
+| `neoraptor_heap_resident_bytes`   | Gauge     | Resident heap bytes (jemalloc stats.resident)          |
 
 **Alerts:**
 - Heap growth > 10 MB/minute for 5 minutes → warning
@@ -322,7 +324,7 @@ NEORAPTOR provides pre-built Grafana dashboards:
 4. **Actor Health**: Mailbox depth, backpressure events, panic rate
 5. **Sandbox Metrics**: Spawn latency, CPU/memory usage, network traffic
 6. **Coverage Map**: Coverage by dimension (ports, subnets, vulnerability classes)
-7. **Heap Health**: Heap size, growth rate, GC pauses
+7. **Heap Health**: Heap allocations, active bytes, resident memory (via jemalloc)
 
 **Import:** Dashboards are in `deploy/grafana/dashboards/`.
 
