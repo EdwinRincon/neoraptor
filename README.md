@@ -16,7 +16,6 @@ Unlike opaque AI agents or static scanners, NEORAPTOR is engineered in Rust with
 - **Rust:** `1.82+` (see `rust-toolchain.toml`)
 - **Docker:** For sandboxed tool execution
 - **PostgreSQL:** Event log and artifact storage
-- **Environment:** Linux or macOS (WSL2 supported)
 
 ### Build & Run
 

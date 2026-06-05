@@ -99,6 +99,7 @@ The cryptographic safety boundary for authorized actions. Defines allowed target
 - Evaluated on **every** state transition in the control plane
 - Violations fail closed at planning time (before probe dispatch)
 - Not `Clone` — constructed only via `ScopeContractBuilder` at startup
+- Shared across async boundaries via `Arc<ScopeContract>` only
 - Missing `allowed_targets` is a hard startup failure
 
 **See:** [security.md](./security.md) for enforcement semantics and governance model.
@@ -167,6 +168,7 @@ crates/
 ├── planner/              (Typed autonomy loop)
 ├── executor/             (Sandbox lifecycle)
 ├── agents-core/          (Core primitives: RunEvent, ScopeContract, ProbeSpec, EvidenceArtifact)
+│                         (Design: Keep ONLY truly universal types; move domain-specific models to subcrates and re-export selectively)
 ├── event-store/          (Append-only persistence with versioned migrations)
 ├── sandbox/              (Isolation primitives)
 ├── tools/                (Typed tool family definitions)
@@ -212,8 +214,8 @@ pub enum ExecutorError {
     #[error("Timeout after {elapsed:?}")]
     Timeout { elapsed: Duration },
 
-    #[error("Sandbox failure: {0}")]
-    SandboxFailure(String),
+    #[error("Sandbox failure: {kind}")]
+    SandboxFailure { kind: SandboxFailureKind },  // Structured enum instead of stringly-typed
 
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
@@ -227,10 +229,20 @@ pub enum ResourceKind {
     Timeout,
 }
 
+pub enum SandboxFailureKind {
+    SpawnFailed,
+    StreamInterrupted,
+    ExitCodeNonZero,
+    OutputMalformed,
+    ProcessKilled,
+}
+
 type ExecutorResult = Result<EvidenceArtifact, ExecutorError>;
 ```
 
-**Rationale:** `ResourceExhausted` with `String` allocates on the hot error path. Using a `ResourceKind` enum (or `&'static str` for fixed names) eliminates avoidable heap allocation in sandbox failure loops.
+**Rationale:** 
+- `ResourceExhausted` with `String` allocates on the hot error path. Using a `ResourceKind` enum eliminates avoidable heap allocation in sandbox failure loops.
+- `SandboxFailure(String)` loses structured matching and incurs heap allocation during common sandbox failure cases. Replacing with `SandboxFailure { kind: SandboxFailureKind }` enables precise error handling and preserves pattern-matching capability.
 
 The concrete `ExecutorError` enum preserves pattern-matching capability for policy violations, resource exhaustion, and timeouts across IPC boundaries.
 
@@ -239,7 +251,53 @@ The concrete `ExecutorError` enum preserves pattern-matching capability for poli
 - **Permanent** (validation, policy): fail immediately, log, emit `ProbeFailed`
 - **Panic** (logic bug): captured by supervisor, logged, escalated to operator
 
+**Retry Classification:**
+
+To prevent retries from looping on permanent policy violations or failing fast on recoverable timeouts, retryability is encoded via a shared error trait:
+
+```rust
+pub trait Retryable: sealed::Sealed {
+    fn is_retryable(&self) -> bool;
+}
+
+impl Retryable for ExecutorError {
+    fn is_retryable(&self) -> bool {
+        match self {
+            Self::ResourceExhausted { .. } => true,   // Transient
+            Self::Timeout { .. } => true,              // Transient
+            Self::SandboxFailure { kind } => {
+                matches!(kind, 
+                    SandboxFailureKind::StreamInterrupted | 
+                    SandboxFailureKind::ProcessKilled
+                )
+            },
+            Self::PolicyViolation(_) => false,         // Permanent
+            Self::Io(_) => true,                       // Potentially transient
+        }
+    }
+}
+
+impl Retryable for PlannerError {
+    fn is_retryable(&self) -> bool {
+        match self {
+            Self::CoverageMapUnavailable => true,     // Transient
+            Self::ScopeViolation(_) => false,         // Permanent
+            // ...
+        }
+    }
+}
+```
+
+All backoff code consumes the `Retryable` trait uniformly, preventing retry decisions from drifting across layers.
+
 **See:** [runtime.md](./runtime.md) for panic handling and escalation typestate.
+
+**Note on Implementation Alignment:**
+
+The architecture described here represents the intended design. For verification that the live codebase matches these documented boundaries:
+- Audit the actual module tree in `crates/agents-core/src/` to confirm domain-specific types have been moved to subcrates
+- Check `crates/` layout to verify error-core split into per-domain crates
+- Validate that concrete Rust signatures align with the ownership and borrowing patterns described here
 
 ## Observability
 

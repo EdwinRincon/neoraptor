@@ -95,8 +95,10 @@ impl ScopeContract {
         }
         
         // 2. Domain validation (if applicable)
+        // CRITICAL: Use label-sequence comparison ONLY. Never use ends_with() or suffix matching.
+        // See domain-model.md for is_domain_allowed implementation using NormalizedDomain.
         if let Some(domain) = &probe.target.domain {
-            if !self.allowed_domains.iter().any(|d| domain.ends_with(d)) {
+            if !self.is_domain_allowed(domain) {
                 return Err(PolicyViolation::UnauthorizedDomain);
             }
         }
@@ -125,6 +127,22 @@ impl ScopeContract {
         }
         
         Ok(())
+    }
+    
+    /// CRITICAL: Domain validation MUST use normalized label-sequence comparison.
+    ///
+    /// # Security Invariant
+    /// This method delegates to the preparsed NormalizedDomain matching logic
+    /// documented in domain-model.md. It NEVER uses suffix-style checks like
+    /// ends_with(), which are vulnerable to subdomain bypass attacks.
+    ///
+    /// Example attack prevented: "evil-example.com".ends_with("example.com") → true (WRONG)
+    /// Correct behavior: label-sequence comparison → false
+    ///
+    /// See domain-model.md for full implementation.
+    fn is_domain_allowed(&self, domain: &str) -> bool {
+        // Implementation delegated to NormalizedDomain as documented in domain-model.md
+        unimplemented!("See domain-model.md for label-sequence validation logic")
     }
 }
 ```

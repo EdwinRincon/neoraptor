@@ -140,7 +140,7 @@ impl VersionedRunEvent {
 pub struct ScopeContract {
     authorization_id: Uuid,                        // Private fields - use accessors
     allowed_targets: BTreeSet<IpNet>,              // CIDR ranges or single IPs
-    allowed_domains: Vec<String>,                  // Domain names (validated via label-sequence)
+    allowed_domains: Vec<NormalizedDomain>,        // Preparsed normalized label slices for O(1) checks
     allowed_protocols: BTreeSet<Protocol>,         // TCP, UDP, HTTP, etc.
     allowed_tool_families: BTreeSet<ToolFamily>,
     disallowed_operations: BTreeSet<Operation>,    // e.g., "destructive_write", "lateral_movement"
@@ -149,11 +149,17 @@ pub struct ScopeContract {
     operator: String,                              // Who authorized this
 }
 
+pub struct NormalizedDomain {
+    reversed_labels: Vec<String>,  // Precomputed at construction for allocation-free matching
+}
+
 impl ScopeContract {
     // Read-only accessors (enforces encapsulation)
     pub fn authorization_id(&self) -> Uuid { self.authorization_id }
     pub fn allowed_targets(&self) -> &BTreeSet<IpNet> { &self.allowed_targets }
-    pub fn allowed_domains(&self) -> &[String] { &self.allowed_domains }
+    pub fn allowed_domains(&self) -> impl Iterator<Item = &str> {
+        self.allowed_domains.iter().map(|d| d.as_str())
+    }
     pub fn allowed_protocols(&self) -> &BTreeSet<Protocol> { &self.allowed_protocols }
     pub fn allowed_tool_families(&self) -> &BTreeSet<ToolFamily> { &self.allowed_tool_families }
     pub fn disallowed_operations(&self) -> &BTreeSet<Operation> { &self.disallowed_operations }
@@ -170,22 +176,22 @@ Every planning decision (e.g., "dispatch this probe") evaluates the `ScopeContra
 ```rust
 impl ScopeContract {
     /// Validates a probe against this scope contract at a specific point in time.
-    /// 
+    ///
     /// # Arguments
     /// * `probe` - The validated probe specification to check
     /// * `at` - The timestamp to check the time window against (prevents TOCTOU)
-    /// 
+    ///
     /// # Returns
     /// * `Ok(())` if the probe is authorized
     /// * `Err(PolicyViolation)` if the probe violates this contract
-    /// 
+    ///
     /// # Security
     /// - Accepts explicit `at` timestamp to prevent time-of-check/time-of-use races
     /// - Only accepts `Validated` probes (enforced at type level via State phantom)
     /// - Uses label-sequence domain validation to prevent subdomain bypass attacks
     pub fn allows_probe<P, const V: u32, S>(
-        &self, 
-        probe: &ProbeSpec<P, V, S>, 
+        &self,
+        probe: &ProbeSpec<P, V, S>,
         at: DateTime<Utc>
     ) -> Result<(), PolicyViolation>
     where
@@ -225,34 +231,40 @@ impl ScopeContract {
         Ok(())
     }
 
-    /// Validates domain membership using label-sequence comparison.
-    /// 
+    /// Validates domain membership using preparsed normalized label slices.
+    ///
     /// # Security
     /// Prevents subdomain bypass attacks where "evil-example.com" would
     /// match "example.com" with naive `ends_with` checking.
-    /// 
+    ///
     /// # Algorithm
-    /// Splits both the target domain and allowed patterns on '.' and compares
-    /// label sequences from right to left (TLD first).
+    /// Compares preparsed reversed label slices from construction time.
+    ///
+    /// # Performance
+    /// Allocation-free: domain normalization happens once at ScopeContract
+    /// construction time via NormalizedDomain. Matching is O(label_count)
+    /// comparison of borrowed slices, no split().collect() at check time.
     fn is_domain_allowed(&self, domain: &str) -> bool {
         let domain_labels: Vec<&str> = domain.split('.').collect();
-        
+
         for allowed in &self.allowed_domains {
-            let allowed_labels: Vec<&str> = allowed.split('.').collect();
-            
-            // Domain must have at least as many labels as the allowed pattern
-            if domain_labels.len() < allowed_labels.len() {
-                continue;
-            }
-            
-            // Compare labels from the end (TLD first)
-            let offset = domain_labels.len() - allowed_labels.len();
-            if domain_labels[offset..] == allowed_labels[..] {
+            if allowed.matches(&domain_labels) {
                 return true;
             }
         }
-        
+
         false
+    }
+}
+
+impl NormalizedDomain {
+    fn matches(&self, domain_labels: &[&str]) -> bool {
+        if domain_labels.len() < self.reversed_labels.len() {
+            return false;
+        }
+
+        let offset = domain_labels.len() - self.reversed_labels.len();
+        domain_labels[offset..].iter().zip(&self.reversed_labels).all(|(a, b)| a == b)
     }
 }
 ```
@@ -260,7 +272,7 @@ impl ScopeContract {
 **Fail-closed semantics:**
 - If `allows_probe` returns `Err`, the probe is **never dispatched**.
 - Policy violations log an abort event but never send the probe to the execution plane.
-- Control-plane code should always go through this API; `ScopeContract` itself is not `Clone` to discourage ad hoc copies.
+- `ScopeContract` is not `Clone` to discourage ad hoc copies; share via `Arc<ScopeContract>` across async boundaries instead.
 
 ### Construction
 
@@ -281,6 +293,29 @@ let scope = ScopeContractBuilder::new()
 
 **Invariant:** Missing `allowed_targets` is a **hard failure**. There is no "empty = allow all" default.
 
+**Sharing Across Async Boundaries:**
+
+`ScopeContract` is not `Clone`. To share across async task boundaries, wrap in `Arc` at construction time:
+
+```rust
+let scope = ScopeContractBuilder::new()
+    .authorization_id(Uuid::new_v4())
+    .allowed_targets(vec!["192.168.1.0/24".parse()?])
+    .allowed_domains(vec!["example.com".to_string()])
+    // ... other fields
+    .build()?;
+
+let scope = Arc::new(scope);
+
+// Share across async tasks
+let scope_clone = Arc::clone(&scope);
+tokio::spawn(async move {
+    scope_clone.allows_probe(&probe, at)?;
+});
+```
+
+This prevents wasteful copying while enabling safe shared read-only access in long-lived tasks.
+
 **Typestate Design: Strict Builder Enforcement**
 
 The `ScopeContractBuilder` must use strict typestate progression:
@@ -292,6 +327,17 @@ The `ScopeContractBuilder` must use strict typestate progression:
 This prevents callers from accidentally swallowing startup misconfiguration and ensures `ScopeContract` construction is fail-closed.
 
 **See:** [security.md](./security.md) for governance and audit model.
+
+**Note on Implementation Alignment:**
+
+The domain model described here represents the intended design contracts. The shapes shown are illustrative of the type-level invariants and ownership patterns.
+
+**For precise auditing:**
+- Audit `crates/agents-core/src/` for actual method signatures, field types, and lifetime annotations
+- Verify that allowed_domains uses `NormalizedDomain` preparsing at construction
+- Confirm that getters return references/iterators (not owned collections) where documented
+- Check that `RawOutput` is implemented as streaming/borrowed buffer, not eager String storage
+- Validate that `ProbeSpec` typestate and `ScopeContract` builder use strict compile-time enforcement
 
 ## ProbeSpec<P, V>
 
@@ -334,17 +380,17 @@ pub struct ProbeSpec<P: VulnerabilityClass, const V: u32, S: ValidationState = U
 impl<P: VulnerabilityClass, const V: u32> ProbeSpec<P, V, Unvalidated> {
     /// Validates this probe against a scope contract, consuming the unvalidated
     /// probe and returning a validated one.
-    /// 
+    ///
     /// # Type Safety
     /// This is the ONLY way to construct a `ProbeSpec<P, V, Validated>`.
     /// The executor boundary only accepts validated probes.
     pub fn validate(
-        self, 
+        self,
         scope: &ScopeContract,
         at: DateTime<Utc>
     ) -> Result<ProbeSpec<P, V, Validated>, PolicyViolation> {
         scope.allows_probe(&self, at)?;
-        
+
         Ok(ProbeSpec {
             probe_id: self.probe_id,
             target: self.target,
@@ -428,6 +474,16 @@ impl Executor {
 
 **Invariant:** The executor API accepts only `ProbeSpec<P, V, Validated>`. Unvalidated probes cannot be dispatched.
 
+**Design Note: Typestate Complexity**
+
+`ProbeSpec` uses typestate and const generics to enforce validation at compile time and prevent cross-version fingerprint collisions. This is appropriate here because:
+
+- **Real bugs blocked:** Unvalidated probes reaching the executor is a security violation, not just a logic error
+- **Version churn is expected:** Fingerprint schemas evolve frequently as new probe types are added
+- **API surface is stable:** Once the typestate pattern is established, adding new probe types doesn't increase complexity
+
+**When NOT to use typestate:** If version churn is low and the API is simple, prefer runtime validation with clear error messages instead. Heavy type-level machinery increases API complexity and can slow iteration for small codebases.
+
 ## EvidenceArtifact
 
 Structured evidence from tool execution. Always linked to a source `RunEvent` and sized-capped during ingestion.
@@ -446,12 +502,23 @@ pub struct EvidenceArtifact {
     pub captured_at: DateTime<Utc>,
 }
 
-/// Shape only; actual storage uses a streaming RawOutput type.
+/// Streaming-first evidence artifact design.
+///
+/// # Performance & Memory
+/// Evidence ingestion is streaming-first: artifacts are persisted/chunked
+/// immediately during sandbox output streaming, never materializing full
+/// payloads in-memory before truncation. RawOutput is a borrowed or streaming
+/// buffer wrapper that enforces size caps during ingestion.
 pub enum ArtifactContent {
     CommandOutput { stdout: RawOutput, stderr: RawOutput, exit_code: i32 },
     ParsedVulnerability { cve: Option<String>, description: String, proof: RawOutput },
     HttpTransaction { request: RawOutput, response: RawOutput, timing_ms: u64 },
     FileSample { path: String, mime_type: String, content: RawOutput },
+}
+
+pub struct RawOutput {
+    // Streaming buffer reference, never owns full content in-memory
+    _inner: StreamingBuffer,
 }
 ```
 

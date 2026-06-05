@@ -99,7 +99,7 @@ The `Executor` owns sandbox lifecycle. It:
 - Streams tool output with size caps
 - Emits `ProbeCompleted` or `ProbeFailed` events
 
-**Sandbox execution (shape):**
+**Sandbox execution:**
 ```rust
 impl Executor {
     async fn execute_probe<P: VulnerabilityClass, const V: u32>(
@@ -107,15 +107,30 @@ impl Executor {
         probe: ProbeSpec<P, V, Validated>,
     ) -> Result<Vec<EvidenceArtifact>, ProbeError> {
         let sandbox = self.sandbox_pool.acquire().await?;
-        let output = sandbox.run_tool(probe.tool_family, probe.parameters).await?;
-        // Size caps and streaming ingestion are enforced at this boundary.
-        let artifacts = self.ingest_with_cap(output)?;
+        
+        // Streaming API with early abort on size threshold
+        let output_stream = sandbox.run_tool_streaming(
+            probe.tool_family, 
+            probe.parameters
+        ).await?;
+        
+        let artifacts = self.ingest_stream_with_cap(
+            output_stream, 
+            MAX_ARTIFACT_SIZE
+        ).await?;
+        
         Ok(artifacts)
     }
 }
 ```
 
+**Design: Streaming-First Cap Enforcement**
+
+Size caps are enforced during streaming ingestion, not after full buffering. The sandbox API returns a `Stream` of chunks, and `ingest_stream_with_cap` aborts early once size thresholds are exceeded. This prevents unbounded memory spikes from large or malicious tool outputs.
+
 **Retry policy (high level):** Transient errors (e.g., timeouts, resource exhaustion) may be retried with exponential backoff. Permanent errors (e.g., policy violations) fail immediately without retry.
+
+**See [architecture.md](./architecture.md) for error retryability encoding via `fn is_retryable(&self) -> bool`.**
 
 ### Validator
 
@@ -189,6 +204,28 @@ std::panic::set_hook(Box::new(move |info| {
 }));
 ```
 
+**Panic Hook Lifetime:**
+
+The panic hook is installed exactly once during startup via a guarded initializer:
+
+```rust
+use std::sync::Once;
+
+static PANIC_HOOK_INIT: Once = Once::new();
+
+pub fn install_panic_hook(panic_sink: Arc<PanicLogSink>) {
+    PANIC_HOOK_INIT.call_once(|| {
+        let prev_hook = std::panic::take_hook();  // Store previous hook if chaining is needed
+        std::panic::set_hook(Box::new(move |info| {
+            panic_sink.log(format!("{:?}", info));
+            // Optionally: prev_hook(info); for chaining
+        }));
+    });
+}
+```
+
+**Invariant:** `install_panic_hook` is called exactly once from `main()` before any actors spawn. Multiple calls are no-ops due to the `Once` guard. This prevents accidental replacement or late installation that could lose diagnostics.
+
 **Invariant:** The panic-log sink outlives all actors (see Shutdown Ordering below).
 
 ## Backpressure Strategy
@@ -200,6 +237,34 @@ Unbounded queues lead to memory exhaustion. NEORAPTOR uses bounded queues with e
 Every actor mailbox has a capacity limit, configured per actor type.
 
 **Exceeding capacity:** New messages trigger backpressure rather than unbounded queue growth (see shedding rules below).
+
+**Mailbox API: Typed Send Wrappers**
+
+Mailboxes are wrapped in typed send APIs that enforce `CanShed` / `NeverShed` semantics:
+
+```rust
+pub struct ShedableMailbox<M: CanShed> {
+    inner: mpsc::Sender<M>,
+}
+
+impl<M: CanShed> ShedableMailbox<M> {
+    pub fn try_send(&self, msg: M) -> Result<(), TrySendError<M>> {
+        self.inner.try_send(msg)  // Non-blocking; sheds if full
+    }
+}
+
+pub struct GuaranteedMailbox<M: NeverShed> {
+    inner: mpsc::Sender<M>,
+}
+
+impl<M: NeverShed> GuaranteedMailbox<M> {
+    pub async fn send(&self, msg: M) -> Result<(), SendError<M>> {
+        self.inner.send(msg).await  // Blocks until capacity available
+    }
+}
+```
+
+This prevents `try_send` from being accidentally used with governance events and ensures backpressure semantics are explicit at the type level.
 
 ### Shedding Rules
 
@@ -241,6 +306,45 @@ pub struct ActorRegistry {
     // Exact storage and handle types are implementation details.
 }
 ```
+
+**Task Ownership and Cancellation:**
+
+All actor tasks are spawned through a centralized `ActorSupervisor` that owns cancellation tokens:
+
+```rust
+pub struct ActorSupervisor {
+    cancellation_token: CancellationToken,
+    task_tracker: TaskTracker,
+}
+
+impl ActorSupervisor {
+    pub fn spawn<F>(&self, future: F) -> JoinHandle<F::Output>
+    where
+        F: Future + Send + 'static,
+        F::Output: Send + 'static,
+    {
+        let token = self.cancellation_token.child_token();
+        self.task_tracker.spawn(async move {
+            tokio::select! {
+                result = future => result,
+                _ = token.cancelled() => {
+                    // Graceful cancellation
+                }
+            }
+        })
+    }
+    
+    pub async fn shutdown(&self) {
+        self.cancellation_token.cancel();  // Signal all tasks
+        self.task_tracker.close();
+        self.task_tracker.wait().await;    // Join explicitly
+    }
+}
+```
+
+**Invariant:** All spawns route through `ActorSupervisor::spawn`. Direct `tokio::spawn` calls are prohibited to prevent detached tasks from outliving shutdown signals or holding resources longer than intended.
+
+**Enforcement:** Add a clippy lint or code review checklist item to forbid raw `tokio::spawn` outside of `ActorSupervisor`. CI should reject PRs that bypass the supervisor.
 
 ### Shutdown Ordering
 
