@@ -1,0 +1,281 @@
+Project Neoraptor {
+  database_type: "PostgreSQL"
+}
+
+Enum run_status {
+  initiated
+  running
+  completed
+  aborted
+}
+
+Enum event_kind {
+  run_initiated
+  run_completed
+  run_aborted
+  target_discovered
+  probe_dispatched
+  probe_completed
+  probe_failed
+  finding_confirmed
+  false_positive
+  escalation_proposed
+  escalation_transitioned
+  coverage_updated
+  artifact_truncated
+  probe_shed
+}
+
+Enum finding_status {
+  pending
+  confirmed
+  disputed
+  false_positive
+}
+
+Enum escalation_state {
+  proposed
+  approved
+  disputed
+  superseded
+}
+
+Enum artifact_kind {
+  command_output
+  parsed_vulnerability
+  http_transaction
+  file_sample
+  generic
+}
+
+Enum coverage_dimension_kind {
+  port_range
+  subnet_range
+  vulnerability_class
+  tool_family
+}
+
+Enum probe_status {
+  pending
+  validated
+  dispatched
+  completed
+  failed
+  shed
+}
+
+Enum artifact_storage_kind {
+  inline
+  object_storage
+}
+
+Table scope_contracts {
+  id                     uuid [pk, default: `gen_random_uuid()`]
+  authorization_id       uuid [not null, unique]
+  name                   text [not null]
+  allowed_targets        jsonb [not null]
+  allowed_domains        jsonb [not null]
+  allowed_protocols      jsonb [not null]
+  allowed_tool_families  jsonb [not null]
+  disallowed_operations  jsonb [not null]
+  valid_from             timestamptz [not null]
+  valid_until            timestamptz [not null]
+  operator               text [not null]
+  created_at             timestamptz [not null, default: `now()`]
+
+  Indexes {
+    (authorization_id) [name: "idx_scope_contracts_authorization_id"]
+    (valid_until) [name: "idx_scope_contracts_valid_until"]
+  }
+}
+
+Table runs {
+  id                uuid [pk, default: `gen_random_uuid()`]
+  authorization_id  uuid [not null, ref: > scope_contracts.authorization_id]
+  name              text [not null]
+  goal              text [not null]
+  status            run_status [not null, default: 'initiated']
+  started_at        timestamptz
+  completed_at      timestamptz
+  created_at        timestamptz [not null, default: `now()`]
+  updated_at        timestamptz [not null, default: `now()`]
+  version           integer [not null, default: 0]
+
+  Indexes {
+    (authorization_id, created_at) [name: "idx_runs_auth_created"]
+    (status, created_at) [name: "idx_runs_status_created"]
+  }
+}
+
+Table run_events {
+  id                bigint [pk, increment]
+  run_id            uuid [not null, ref: > runs.id]
+  event_index       bigint [not null]
+  kind              event_kind [not null]
+  schema_version    integer [not null, default: 1]
+  authorization_id  uuid [not null, ref: > scope_contracts.authorization_id]
+  occurred_at       timestamptz [not null, default: `now()`]
+  actor             text [not null]
+  payload_type      text [not null]
+  payload           jsonb [not null]
+  metadata          jsonb [not null, default: '{}']
+  payload_hash      text [not null]
+
+  Indexes {
+    (run_id, event_index) [unique, name: "uniq_run_event_index"]
+    (run_id, occurred_at) [name: "idx_run_events_run_occurred"]
+    (kind, occurred_at) [name: "idx_run_events_kind_occurred"]
+    (authorization_id, occurred_at) [name: "idx_run_events_auth_occurred"]
+    (occurred_at) [name: "idx_run_events_occurred_at"]
+  }
+
+  Note: "Append-only source of truth. Never update or delete rows. Partition this table by occurred_at when volume grows. Keep event_index monotonic per run. payload is versioned JSON migrated on read."
+}
+
+Table run_snapshots {
+  id                   uuid [pk, default: `gen_random_uuid()`]
+  run_id               uuid [not null, ref: > runs.id]
+  snapshot_event_index bigint [not null]
+  schema_version       integer [not null, default: 1]
+  state                jsonb [not null]
+  state_hash           text [not null]
+  created_at           timestamptz [not null, default: `now()`]
+
+  Indexes {
+    (run_id, snapshot_event_index) [unique, name: "uniq_run_snapshot_index"]
+    (run_id, created_at) [name: "idx_run_snapshots_run_created"]
+    (created_at) [name: "idx_run_snapshots_created_at"]
+  }
+
+  Note: "Deterministic replay accelerator. Store latest known derived state plus integrity hash. Append-only; never rewrite old snapshots."
+}
+
+Table probes {
+  id                uuid [pk, default: `gen_random_uuid()`]
+  run_id            uuid [not null, ref: > runs.id]
+  probe_type        text [not null]
+  schema_version    integer [not null, default: 1]
+  target            text [not null]
+  protocol          text [not null]
+  tool_family       text [not null]
+  status            probe_status [not null, default: 'pending']
+  created_at        timestamptz [not null, default: `now()`]
+  updated_at        timestamptz [not null, default: `now()`]
+
+  Indexes {
+    (run_id, status) [name: "idx_probes_run_status"]
+    (run_id, probe_type) [name: "idx_probes_run_type"]
+    (run_id, created_at) [name: "idx_probes_run_created"]
+  }
+
+  Note: "Derived operational view for queued/active/completed probes. The executor still consumes typed validated probes from the app layer."
+}
+
+Table evidence_artifacts {
+  id                uuid [pk, default: `gen_random_uuid()`]
+  run_id            uuid [not null, ref: > runs.id]
+  source_event_id   bigint [not null, ref: > run_events.id]
+  probe_id          uuid [ref: > probes.id]
+  kind              artifact_kind [not null]
+  storage_kind      artifact_storage_kind [not null, default: 'object_storage']
+  tool_family       text [not null]
+  tool_version      text [not null]
+  content_type      text [not null]
+  storage_uri       text
+  content           bytea
+  size_bytes        bigint [not null]
+  truncated         boolean [not null, default: false]
+  captured_at       timestamptz [not null, default: `now()`]
+  content_hash      text [not null]
+
+  Indexes {
+    (run_id, captured_at) [name: "idx_artifacts_run_captured"]
+    (source_event_id) [name: "idx_artifacts_source_event"]
+    (run_id, kind, captured_at) [name: "idx_artifacts_run_kind_captured"]
+  }
+
+  Note: "Prefer object storage for large payloads via storage_uri. Small artifacts may remain inline only when explicitly selected. Streaming ingestion should populate this table only after cap checks."
+}
+
+Table findings {
+  id                uuid [pk, default: `gen_random_uuid()`]
+  run_id            uuid [not null, ref: > runs.id]
+  source_event_id   bigint [ref: > run_events.id]
+  probe_id          uuid [ref: > probes.id]
+  severity          text [not null]
+  status            finding_status [not null, default: 'pending']
+  title             text [not null]
+  description       text [not null]
+  evidence          jsonb [not null, default: '{}']
+  validated_by      text
+  validated_at      timestamptz
+  created_at        timestamptz [not null, default: `now()`]
+  updated_at        timestamptz [not null, default: `now()`]
+
+  Indexes {
+    (run_id, severity) [name: "idx_findings_run_severity"]
+    (run_id, status) [name: "idx_findings_run_status"]
+    (run_id, created_at) [name: "idx_findings_run_created"]
+  }
+
+  Note: "Read model derived from events and validation workflow. Can reference synthesized findings without a probe_id."
+}
+
+Table escalation_records {
+  id                uuid [pk, default: `gen_random_uuid()`]
+  run_id            uuid [not null, ref: > runs.id]
+  source_event_id   bigint [ref: > run_events.id]
+  state             escalation_state [not null]
+  reason            text [not null]
+  operator_id       text
+  authorization_id  uuid [not null, ref: > scope_contracts.authorization_id]
+  retry_count       integer [not null, default: 0]
+  next_retry_at     timestamptz
+  correlation_id    uuid [not null, default: `gen_random_uuid()`]
+  last_error        text
+  transitioned_at   timestamptz [not null, default: `now()`]
+  created_at        timestamptz [not null, default: `now()`]
+  updated_at        timestamptz [not null, default: `now()`]
+
+  Indexes {
+    (run_id, state) [name: "idx_escalations_run_state"]
+    (next_retry_at) [name: "idx_escalations_next_retry"]
+    (correlation_id) [name: "idx_escalations_correlation"]
+    (run_id, transitioned_at) [name: "idx_escalations_run_transitioned"]
+  }
+
+  Note: "Projection of the escalation state machine. The canonical transition history remains in run_events."
+}
+
+Table coverage_map {
+  id                uuid [pk, default: `gen_random_uuid()`]
+  run_id            uuid [not null, ref: > runs.id]
+  target_component  text [not null]
+  attack_class      text [not null]
+  dimension_kind    coverage_dimension_kind [not null]
+  status            text [not null]
+  coverage_before   decimal [not null, default: 0]
+  coverage_after    decimal [not null, default: 0]
+  last_updated_at   timestamptz [not null, default: `now()`]
+  created_at        timestamptz [not null, default: `now()`]
+
+  Indexes {
+    (run_id, target_component, attack_class) [unique, name: "uniq_coverage_run_target_attack"]
+    (run_id, last_updated_at) [name: "idx_coverage_run_updated"]
+  }
+}
+
+Table artifact_links {
+  id                 uuid [pk, default: `gen_random_uuid()`]
+  artifact_id        uuid [not null, ref: > evidence_artifacts.id]
+  related_finding_id uuid [ref: > findings.id]
+  related_event_id   bigint [ref: > run_events.id]
+  relation_kind      text [not null]
+  created_at         timestamptz [not null, default: `now()`]
+
+  Indexes {
+    (artifact_id) [name: "idx_artifact_links_artifact"]
+    (related_finding_id) [name: "idx_artifact_links_finding"]
+    (related_event_id) [name: "idx_artifact_links_event"]
+  }
+}
