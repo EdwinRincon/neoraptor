@@ -209,6 +209,24 @@ When backpressure is triggered, the system:
 2. Enforces a hard cap on the human-review queue for disputed findings and escalations.
 3. Throttles or rejects new runs when capacity thresholds are exceeded (e.g., HTTP 429).
 
+**Message Queue API Design: Typestate Shedding Policy**
+
+To prevent governance events like `EscalationTransitioned` from being silently dropped, the message queue API restricts shed-enabled mailboxes:
+
+- **Shed-enabled mailboxes** accept only messages implementing `CanShed` marker trait
+- **Governance events** implement `NeverShed` marker trait
+- Invalid enqueues (e.g., `NeverShed` message to shed-enabled queue) fail at compile time
+
+This ensures priority shedding cannot break replay or state consistency by accidentally dropping critical governance transitions.
+
+**Audit Trail: ProbeShed Events**
+
+When a message is dropped due to backpressure, a `ProbeShed` run event is emitted to the event log. This enables:
+
+- Operators to distinguish "not probed" from "probed and found nothing"
+- Replay to reconstruct when shedding occurred
+- Incident review to explain missing work and correlate gaps in probing
+
 **Metrics:** Queue depth and drop rate are exposed via Prometheus and used to tune capacities in configuration and ADRs.
 
 ## Supervision and Shutdown
@@ -227,6 +245,18 @@ pub struct ActorRegistry {
 ### Shutdown Ordering
 
 **Invariant:** Panic-log sink must outlive all actors to ensure no panics are lost.
+
+**Design: Typestate-Encoded Shutdown Phases**
+
+To enforce the `DrainActors -> FlushLogs` sequencing at compile time, shutdown ordering is encoded as a typestate progression:
+
+```
+Shutdown<Active> -> Shutdown<DrainActors> -> Shutdown<FlushLogs> -> Done
+```
+
+This makes the drop order type-checked rather than relying solely on runtime `TaskTracker` sequencing. A refactor that reorders shutdown phases will fail at compile time instead of silently losing late panics.
+
+**Current Implementation (TaskTracker-based):**
 
 ```rust
 // In api/src/main.rs
@@ -316,6 +346,16 @@ impl InfraHandlesBuilder<StartupPhase> {
 ```
 
 **Benefit:** Missing required fields are detected when `build()` is called, not at arbitrary runtime points. Runtime code operates only in the `RuntimePhase`.
+
+### ScopeContract Sharing Across Async Boundaries
+
+**Design: Arc::clone as the Only Sharing Path**
+
+When sharing `ScopeContract` across `async` boundaries, use `Arc::clone(&scope)` as the only supported mechanism. This prevents long-lived tasks from synthesizing alternate scope constructions.
+
+**Invariant:** `ScopeContractBuilder::build()` is restricted to startup wiring. No alternate scope can be constructed after the system enters the runtime phase.
+
+This design makes it safe to share scopes while preventing relaxed governance from being introduced in background tasks.
 
 **ADR:** See [adr/ADR-006-startup-typestate.md](./adr/ADR-006-startup-typestate.md) for full rationale.
 

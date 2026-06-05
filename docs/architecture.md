@@ -22,6 +22,18 @@ NEORAPTOR orchestrates autonomous security testing operations through a strict s
 - **Operator-visible reasoning**: Why this tool, why this path, why this finding — all traceable and replayable.
 - **Backpressure and shedding**: Bounded mailboxes and typed priority shedding prevent unbounded growth while preserving critical work.
 
+### Trust Boundary: Control Plane ↔ Execution Plane
+
+**Design: executor-contract Crate**
+
+To prevent control-plane domain details from leaking into untrusted sandbox-facing code, a dedicated `executor-contract` crate defines the IPC boundary:
+
+- **executor-contract**: Contains only `SandboxRequest` and `SandboxResponse` types
+- **agents-core**: Remains in the control plane; `ProbeSpec<P, V>` semantics stay internal
+- **Conversion at boundary**: Control plane converts `ProbeSpec` to `SandboxRequest` before crossing the trust boundary
+
+**Benefit:** Tight coupling is eliminated, and IPC evolution becomes easier without exposing control-plane domain logic to sandbox code.
+
 ## System Structure
 
 NEORAPTOR is organized into two planes.
@@ -158,7 +170,8 @@ crates/
 ├── event-store/          (Append-only persistence with versioned migrations)
 ├── sandbox/              (Isolation primitives)
 ├── tools/                (Typed tool family definitions)
-├── error-core/           (Shared error types and conversions)
+├── executor-contract/    (IPC types for sandbox boundary: SandboxRequest, SandboxResponse)
+├── error-core/           (Control-plane error types; to be split per-domain)
 └── ui/                   (Coverage map, event stream viewer)
 ```
 
@@ -166,7 +179,24 @@ crates/
 
 ## Error Handling
 
-Cross-cutting error types (I/O, sandbox, policy) are shared via `error-core` using `thiserror` + `From` conversions. `anyhow` usage is confined to `api/` composition and HTTP boundaries.
+**Design Evolution: Per-Domain Error Crates**
+
+The current `error-core` crate is shared across unrelated domains (control plane, execution plane, API). This forces broad recompilation when any error variant changes.
+
+**Recommended architecture:**
+
+- Split `error-core` into per-domain error crates:
+  - `planner-errors` — Planning and orchestration errors
+  - `executor-errors` — Sandbox and tool execution errors
+  - `validator-errors` — Finding validation and false-positive filtering errors
+- Convert errors at the `api` composition boundary using `From` implementations
+- Keep `anyhow` usage confined to `api/` composition and HTTP boundaries
+
+This approach decouples error evolution across domains and reduces unnecessary recompilation.
+
+**Current shared error approach:**
+
+Cross-cutting error types (I/O, sandbox, policy) are shared via `error-core` using `thiserror` + `From` conversions.
 
 **Control plane–execution plane boundary:**
 
@@ -176,8 +206,8 @@ pub enum ExecutorError {
     #[error("Policy violation: {0}")]
     PolicyViolation(PolicyViolation),
 
-    #[error("Resource exhausted: {resource}")]
-    ResourceExhausted { resource: String },
+    #[error("Resource exhausted: {kind}")]
+    ResourceExhausted { kind: ResourceKind },  // Zero-allocation enum instead of String
 
     #[error("Timeout after {elapsed:?}")]
     Timeout { elapsed: Duration },
@@ -189,8 +219,18 @@ pub enum ExecutorError {
     Io(#[from] std::io::Error),
 }
 
+pub enum ResourceKind {
+    Memory,
+    Cpu,
+    Disk,
+    Network,
+    Timeout,
+}
+
 type ExecutorResult = Result<EvidenceArtifact, ExecutorError>;
 ```
+
+**Rationale:** `ResourceExhausted` with `String` allocates on the hot error path. Using a `ResourceKind` enum (or `&'static str` for fixed names) eliminates avoidable heap allocation in sandbox failure loops.
 
 The concrete `ExecutorError` enum preserves pattern-matching capability for policy violations, resource exhaustion, and timeouts across IPC boundaries.
 

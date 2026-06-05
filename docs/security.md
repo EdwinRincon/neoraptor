@@ -188,7 +188,9 @@ impl ScopeContract {
 }
 ```
 
-**Trade-off:** Complexity vs. performance. Start with BTreeSet for v0.1 (correctness first), benchmark under realistic workload (1k+ CIDRs, 100+ probes/sec), and optimize if profiling shows it as a bottleneck.
+**Alternative (for very large scopes):** For scopes with 10k+ CIDRs, consider a CIDR trie (radix tree) for O(prefix-length) lookups using the `ip_network_table` crate.
+
+**Implementation priority:** Benchmark the sorted `Vec<IpNet>` approach against the current `BTreeSet` baseline at realistic scale (1k+ CIDRs, 100+ probes/sec) and adopt if planning becomes a measurable bottleneck.
 
 **Rationale:** Fail-closed governance prevents accidental over-scoping. An empty scope is a configuration error, not a wildcard.
 

@@ -96,6 +96,95 @@ impl VulnerabilityClass for PortScanProbe {
 }
 ```
 
+**Expanded Test Coverage:**
+
+The snapshot test above covers `PortScanProbe` (a unit struct), but probes with fields, async bounds, or const generics may produce different expansions that are never snapshotted. Add the following test cases:
+
+**1. Probe with reference fields (tests lifetime elision):**
+
+```rust
+#[test]
+fn trait_variant_macro_with_reference_fields() {
+    let input = quote! {
+        #[derive(VulnerabilityClass)]
+        pub struct SqlInjectionProbe<'a> {
+            endpoint: &'a Url,
+            payload: &'a str,
+        }
+    };
+    let output = probe_macro::derive_vulnerability_class(input).unwrap();
+    let output_str = prettyplease::unparse(&syn::parse2(output).unwrap());
+    insta::assert_snapshot!(output_str);
+}
+```
+
+**Why:** Validates that the macro correctly preserves lifetime parameters in the generated `impl` block and does not produce `impl VulnerabilityClass for SqlInjectionProbe` (missing `<'a>`).
+
+**2. Probe with async fn returning !Send futures (tests Send bound preservation):**
+
+```rust
+#[test]
+fn trait_variant_macro_preserves_send_bounds() {
+    let input = quote! {
+        #[derive(VulnerabilityClass)]
+        pub struct AsyncProbe {
+            client: Rc<HttpClient>, // !Send
+        }
+    };
+    let output = probe_macro::derive_vulnerability_class(input).unwrap();
+    let output_str = prettyplease::unparse(&syn::parse2(output).unwrap());
+    insta::assert_snapshot!(output_str);
+    
+    // Verify generated trait impl does NOT add spurious Send bounds
+    assert!(!output_str.contains("impl Send"));
+}
+```
+
+**Why:** Ensures the macro does not add `Send` or `Sync` bounds that would prevent usage with `!Send` types like `Rc<T>`.
+
+**3. Probe using const generic in generated impl body:**
+
+```rust
+#[test]
+fn trait_variant_macro_with_const_generics() {
+    let input = quote! {
+        #[derive(VulnerabilityClass)]
+        pub struct VersionedProbe<const V: u32> {
+            target: IpAddr,
+        }
+    };
+    let output = probe_macro::derive_vulnerability_class(input).unwrap();
+    let output_str = prettyplease::unparse(&syn::parse2(output).unwrap());
+    insta::assert_snapshot!(output_str);
+    
+    // Verify const generic appears in impl signature
+    assert!(output_str.contains("impl<const V: u32>"));
+}
+```
+
+**Why:** Validates that const generics are correctly threaded through the macro expansion and appear in the generated `impl` block signature.
+
+**Parameterized snapshots (recommended):**
+
+Use `rstest` or `insta`'s parameterized testing to cover multiple probe variants in a single test:
+
+```rust
+use rstest::rstest;
+
+#[rstest]
+#[case::unit_struct("PortScanProbe", quote! { pub struct PortScanProbe; })]
+#[case::with_fields("SqlInjectionProbe", quote! { pub struct SqlInjectionProbe { endpoint: Url } })]
+#[case::with_lifetimes("RefProbe", quote! { pub struct RefProbe<'a> { data: &'a str } })]
+#[case::with_const_generic("VersionedProbe", quote! { pub struct VersionedProbe<const V: u32> })]
+fn trait_variant_macro_variants(#[case] name: &str, #[case] input: TokenStream) {
+    let output = probe_macro::derive_vulnerability_class(input).unwrap();
+    let output_str = prettyplease::unparse(&syn::parse2(output).unwrap());
+    insta::assert_snapshot!(name, output_str);
+}
+```
+
+This generates separate snapshot files per variant: `PortScanProbe.snap`, `SqlInjectionProbe.snap`, etc.
+
 **CI enforcement:**
 
 ```yaml

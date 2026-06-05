@@ -281,6 +281,16 @@ let scope = ScopeContractBuilder::new()
 
 **Invariant:** Missing `allowed_targets` is a **hard failure**. There is no "empty = allow all" default.
 
+**Typestate Design: Strict Builder Enforcement**
+
+The `ScopeContractBuilder` must use strict typestate progression:
+
+- `with_targets()` advances the builder's type state (e.g., `BuilderWithoutTargets` → `BuilderWithTargets`)
+- `build()` method only exists on the fully-populated state type
+- Missing required fields result in a **compile-time error**, not a runtime error
+
+This prevents callers from accidentally swallowing startup misconfiguration and ensures `ScopeContract` construction is fail-closed.
+
 **See:** [security.md](./security.md) for governance and audit model.
 
 ## ProbeSpec<P, V>
@@ -460,6 +470,19 @@ Artifacts are ingested via streaming with strict size limits:
 Artifacts link to their source events, creating a directed acyclic graph (DAG) of goals, probes, findings, and remediation steps.
 
 **Example query:** "Show me all evidence for finding X" walks the graph backward from `FindingConfirmed` through `ProbeCompleted` to the associated `EvidenceArtifact`s.
+
+## RunStateSnapshot
+
+**Design: Deterministic Snapshotting in v0.1**
+
+To prevent replay cost from growing unboundedly with event volume, `RunStateSnapshot` should be part of the v0.1 runtime path:
+
+- Snapshots are created deterministically at fixed event intervals (e.g., every 1000 events)
+- Each snapshot includes a deterministic hash for integrity verification
+- Replay reconstructs state from the latest snapshot plus tail events
+- Large runs avoid full-log replay by loading the most recent snapshot first
+
+**Benefit:** Replay performance remains constant regardless of run length, and incident investigation on long-running runs becomes tractable.
 
 ## CoverageMap
 

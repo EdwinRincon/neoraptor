@@ -70,8 +70,19 @@ NEORAPTOR exposes Prometheus-compatible metrics at `/metrics`.
 | `neoraptor_actor_messages_processed_total` | Counter | Messages processed by actor |
 | `neoraptor_actor_panics_total` | Counter | Panics captured by supervisor |
 | `neoraptor_backpressure_triggered_total` | Counter | Backpressure events (queue full) |
+| `neoraptor_queue_saturation_total` | Counter | Queue saturation transitions (shed mode entered/exited) |
 
 **Labels:** `actor_type` (orchestrator, planner, executor, validator, chain_planner, mentor, supervisor)
+
+**Queue Saturation Events:**
+
+In addition to the Prometheus counter, a `QueueSaturation` run event is emitted whenever shedding begins or ends. This allows:
+
+- Replay to reconstruct when saturation occurred and correlate it with gaps in probing
+- Operators to distinguish transient saturation spikes from sustained overload
+- Incident review to trace saturation to specific runs or planning decisions
+
+The Prometheus counter remains the live alert signal; the event log provides the durable audit trail.
 
 ### Sandbox Metrics
 

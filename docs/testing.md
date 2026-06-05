@@ -318,6 +318,34 @@ fn run_event_serialization_stable() {
 
 **Rationale:** Event schema changes must be explicit and reviewed. Accidental schema drift breaks event replay.
 
+## Fault Injection Testing
+
+**Design: FaultInjector Test Harness**
+
+Happy-path tests miss critical failure modes in sandbox ingestion: truncation, timeout, and mid-stream policy failures.
+
+**Strategy:**
+
+Introduce a `FaultInjector` test harness for executor paths to exercise fault scenarios deterministically in CI:
+
+- **Truncation faults:** Simulate artifact content exceeding size caps mid-stream
+- **Timeout faults:** Trigger probe timeout at various execution stages (spawn, mid-execution, shutdown)
+- **Policy failures:** Inject scope violations after probe dispatch to test fail-closed enforcement
+
+**Test layout:**
+
+```
+crates/executor/
+├── tests/
+│   ├── fault_injection.rs
+│   └── fault_scenarios/
+│       ├── truncation.rs
+│       ├── timeout.rs
+│       └── policy_violation.rs
+```
+
+**CI integration:** Fault injection tests run on every commit to ensure sandbox ingestion remains robust under adversarial conditions.
+
 ## Property-Based Testing
 
 Hand-written unit tests miss adversarial inputs and boundary conditions. **Recommendation:** Add property-based tests (using `proptest` or `bolero`) for security-critical validation logic.
