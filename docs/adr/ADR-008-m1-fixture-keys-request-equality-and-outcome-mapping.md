@@ -31,9 +31,14 @@ Apply the same rule to `ProbeRequest.fixture_key` and
 continues to require the request key to match the trusted immutable fixture
 configuration key.
 
-This is stricter than the current Rust implementation. `FixtureKey::try_new`
-currently checks only non-empty valid UTF-8 and the 128-byte maximum. The
-accepted ASCII rule is not implemented or tested.
+This rule was stricter than the earlier Rust implementation, which checked
+only non-empty valid UTF-8 and the 128-byte maximum. The Rust domain layer now
+enforces the accepted syntax in `FixtureKey::try_new`, which is used by both
+`ProbeRequest` and `FixtureConfigRevision`; deterministic unit tests cover the
+accepted and rejected syntax, byte limits, constructor consistency, and exact
+case-sensitive binding. These tests passed as part of the 35-test workspace
+suite. Persistence and API-layer enforcement, plus operational verification,
+remain future work and are not claimed here.
 
 ### Request equality and digest
 
@@ -131,14 +136,24 @@ complete artifact establishes an execution outcome or a confirmed finding.
 - **Make projections authoritative:** conflicts with the event-sourced
   contract; projections remain rebuildable views only.
 
-## Proposed acceptance tests
+## Domain tests and future acceptance tests
 
-These are future requirements, not implemented tests or passing results:
+The fixture-key domain tests below are implemented and passed in the Rust
+workspace suite:
 
 | Test | Invariant |
 |---|---|
-| `fixture_key_accepts_only_accepted_ascii_syntax` | Accept only the specified 1–128 byte pattern; reject empty, whitespace-padded, Unicode, invalid-character, and over-limit keys. |
-| `fixture_key_rule_matches_request_and_configuration` | Apply identical validation to request and trusted fixture configuration; preserve exact key binding. |
+| `accepts_fixture_keys_at_one_and_128_utf8_bytes` | Accept valid 1-byte and 128-byte ASCII keys, including the permitted punctuation. |
+| `accepts_fixture_keys_through_request_and_configuration_constructors` | Apply the same rule to `ProbeRequest` and `FixtureConfigRevision`. |
+| `rejects_empty_and_overlong_fixture_keys_by_utf8_byte_length` | Reject empty and over-128-byte keys using UTF-8 byte length. |
+| `rejects_fixture_keys_outside_ascii_syntax` | Reject whitespace, non-ASCII, invalid characters, and disallowed leading punctuation through all constructors. |
+| `fixture_key_binding_remains_case_sensitive_and_exact` | Preserve exact case-sensitive binding to the fixture configuration. |
+
+The following acceptance tests remain proposed for future persistence/API and
+operational implementation work; they are not implemented or verified:
+
+| Test | Invariant |
+|---|---|
 | `idempotency_compares_full_normalized_request` | Equal normalized values return the original result; any changed field conflicts without a new attempt or dispatch. |
 | `approval_requires_exact_request_identity` | Normalized-value equality or run-ID equality alone cannot substitute for the exact approval/request relationship. |
 | `not_established_differs_from_unknown` | No established outcome remains distinct from an explicitly unknown outcome. |
@@ -149,7 +164,8 @@ These are future requirements, not implemented tests or passing results:
 ## Explicit non-goals and deferred decisions
 
 - No application/domain code, persistence, migration, or schema enforcement is
-  implemented by this ADR.
+  implemented by this ADR. The separately implemented Rust domain fixture-key
+  validation does not enforce the rule at persistence or API boundaries.
 - No request digest algorithm, canonical byte encoding, or cryptographic
   dependency is selected.
 - No broker claim, cancellation, retry, reconciliation, recovery, or Docker

@@ -34,8 +34,11 @@ whitespace, non-ASCII characters, and any other character; do not trim, fold
 case, or normalize. Apply the same validation to the trusted
 `FixtureConfigRevision.fixture_key` and proposed request's `fixture_key`.
 Invalid keys fail structural validation before policy evaluation or
-persistence. The current Rust implementation does not yet enforce the ASCII
-rule; see [current status](plan/STATUS.md).
+persistence. The Rust domain layer enforces this rule through
+`FixtureKey::try_new`, used by both request and fixture-configuration
+constructors, and the behavior is covered by passing unit tests. Persistence
+and API-layer enforcement are not implemented or claimed; operational
+verification remains future work. See [current status](plan/STATUS.md).
 
 The complete normalized request value consists of `schema_version`,
 `fixture_key`, `method`, and `fixed_path`, in that conceptual field order.

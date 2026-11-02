@@ -35,8 +35,9 @@ are recorded below. This is not implementation authorization.
   persistence implementation exists.
 - ADR-008's body and the ADR index now consistently identify it as accepted.
   ADR-002, ADR-004, architecture, and testing wording has been reconciled with
-  the no-request-digest decision. The accepted ASCII fixture-key implementation
-  and its unexecuted tests are described below.
+  the no-request-digest decision. Protocol, domain-model, and ADR-008 wording
+  now reflects the implemented, unit-tested domain key validation while keeping
+  persistence/API enforcement and operational verification open.
 - `rust-toolchain.toml` pins Rust `1.95.0`.
 - `docs/product.md` records unvalidated customer and differentiation
   hypotheses, future product directions, and customer-outcome measures.
@@ -79,7 +80,7 @@ and have no persistence conversion.
 
 | Gate | State | Evidence or blocker |
 |---|---|---|
-| A. Domain/storage implementation readiness | Partial pure-domain slice implemented and unit tested; gate remains open. | ADR-008 is accepted and its documentation decisions are reflected in the canonical contracts. ASCII key validation and deterministic tests are implemented; test execution remains pending before API/persistence exposure. Persistence, artifact lifecycle/accounting, event ordering, event/outcome consistency, idempotency, and their tests remain unimplemented. |
+| A. Domain/storage implementation readiness | Partial pure-domain slice implemented and unit tested; gate remains open. | ADR-008 is accepted and its documentation decisions are reflected in the canonical contracts. ASCII key validation and deterministic domain tests are implemented and passing; persistence/API enforcement and operational verification are not established. Persistence, artifact lifecycle/accounting, event ordering, event/outcome consistency, idempotency, and their tests remain unimplemented. |
 | B. Broker/network implementation readiness | Blocked. | Review and validate the supported host/kernel/Docker/firewall compatibility target, broker privilege/identity boundary, concrete network enforcement specification, ownership/reconciliation, and cancellation/deadline behavior. |
 | C. Controlled fixture execution readiness | Blocked. | Requires relevant broker/network and storage safeguards implemented and inspected on the selected host, with representative negative reachability and recovery/cleanup evidence. A finished SvelteKit UI is not required; an authenticated integration-test client may exercise the backend. |
 | D. Full M1 acceptance | Blocked. | Requires reviewed backend, evidence, failure/recovery, network, and frontend acceptance evidence. No M1 acceptance tests have run. |
