@@ -62,9 +62,18 @@ Keep these cases distinct:
 - **Duplicate dispatch delivery** is repeated delivery of an execution
   command and needs an execution-claim/dispatch protocol.
 
-M1 request idempotency and broker execution claims require their own protocol;
-fingerprint typing or schema versioning does not resolve them. Their design
-and failure behavior remain blockers.
+Request idempotency and broker execution claims are separate mechanisms;
+fingerprint typing or schema versioning does not resolve either. ADR-008 and
+the M1 protocol define request comparison as exact equality of the complete
+normalized typed value, without a request digest; a mismatch fails closed.
+Durable idempotency implementation, dispatch claims, and their failure and
+recovery behavior remain readiness gates.
+
+**Revision note:**
+
+ADR-008 supersedes any use of fingerprint or hash identity to compare M1
+requests. The distinctions above remain relevant to fingerprint design in
+general, but do not define M1 request identity or idempotency.
 
 **Revision note:**
 

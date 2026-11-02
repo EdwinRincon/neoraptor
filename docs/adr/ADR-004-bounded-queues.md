@@ -23,9 +23,13 @@ For M1:
 1. Permit only one active target-facing attempt at a time and maintain no
    waiting execution backlog. A new distinct start request while the slot is
    occupied is rejected explicitly as busy; it is not queued for later.
-2. Resolve duplicate requests and dispatches through the eventual idempotency
-   protocol. A duplicate is not automatically a new busy request or a new
-   attempt. That protocol remains a design blocker.
+2. Resolve duplicate requests according to the M1 protocol: compare the full
+   normalized request value exactly, return the original result for the same
+   key and value, and fail closed on a same-key mismatch. No request digest is
+   used. Duplicate dispatch delivery follows the execution-claim protocol.
+   Durable transaction, claim, failure, and recovery behavior remains an
+   implementation-readiness gate. A duplicate is not automatically a new
+   busy request or a new attempt.
 3. Bound both internal queue capacity and the size of each queued payload.
    Exact capacities and numeric send deadlines are implementation/deployment
    decisions and must be justified there.
@@ -70,6 +74,11 @@ guarantee require separate evidence and design. No actor framework is required
 for M1.
 
 **Revision note:**
+
+ADR-008 and the M1 protocol supersede the earlier description of request
+idempotency as an unresolved design blocker: exact normalized-value comparison
+and mismatch behavior are now specified. Their durable implementation and
+dispatch-claim recovery remain open.
 
 This revision supersedes the earlier mandatory-actor mailboxes, numeric
 per-role capacities, drop-by-priority behavior, `PriorityShedder` example,

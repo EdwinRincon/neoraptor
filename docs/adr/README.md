@@ -32,6 +32,10 @@ This directory contains Architecture Decision Records for NEORAPTOR — document
   - Decision: Deferred — outside M1; no custom procedural-macro implementation is established.
   - Why: Reconsider only when an approved capability demonstrates a need for custom procedural macros.
 
+- [ADR-008: M1 Fixture Keys, Request Equality, and Outcome Mapping](./ADR-008-m1-fixture-keys-request-equality-and-outcome-mapping.md)
+  - Decision: Require the accepted fixture-key syntax, exact normalized-request equality without request digests, and authoritative outcome facts.
+  - Why: Keep request identity and execution outcomes explicit without making projections authoritative.
+
 ## ADR Format
 
 Each ADR follows this structure:
