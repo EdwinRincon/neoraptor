@@ -1,174 +1,64 @@
-# ADR-006: Startup Typestate Builder
+# ADR-006: Startup Validation and Explicit Bounded Shutdown
 
 **Status:** Accepted
 
 **Date:** 2026-05-31
 
-**Context:**
+## Context
 
-NEORAPTOR's runtime depends on critical infrastructure components:
-- Event store (for persisting events)
-- Panic-log sink (for capturing panics)
-- Actor registry (for supervision)
+Runtime startup and shutdown depend on required services and resources. Missing configuration, unavailable persistence, worker cleanup, or incomplete shutdown can affect whether target-facing work is safe to admit.
 
-**Problem:**
+The original proposal required typestate builders and an actor registry, and claimed compile-time and `Drop`-based enforcement of shutdown ordering. NEORAPTOR is currently a scaffold; these mechanisms and the associated tests are not implemented.
 
-Partially-initialized infrastructure can lead to:
+## Decision
 
-1. **Runtime panics**: Accessing `None` values in `Option<Arc<T>>` fields
-2. **Silent failures**: Missing components not detected until runtime
-3. **Shutdown bugs**: Panic-log sink dropped before actors exit
+Startup must construct required dependencies, perform fallible configuration and dependency checks, and expose readiness separately from the ability to admit or dispatch work. A successful startup check is a point-in-time result; it does not guarantee ongoing dependency availability.
 
-**Decision:**
+Before M1 dispatch admission is enabled, recovery must inspect workers belonging to this deployment. The system needs trustworthy worker ownership identifiers, an inspection process, and orphan handling. Unresolved cleanup prevents new target execution. The specific broker protocol and deployment topology remain open design decisions.
 
-Encapsulate startup in a **typestate builder** that enforces required fields at compile time:
+Shutdown is an explicit, bounded asynchronous operation coordinated by a live task, not a destructor guarantee:
 
-```rust
-pub struct InfraHandlesBuilder<State> {
-    event_store: Option<Arc<EventStore>>,
-    panic_sink: Option<Arc<PanicLogSink>>,
-    actor_registry: Option<Arc<ActorRegistry>>,
-    _state: PhantomData<State>,
-}
+1. Close admission to new work and prevent new dispatch.
+2. Persist stop/cancellation intent where persistence is available.
+3. Request worker cancellation and stop; terminate remaining workers after a bounded grace period.
+4. Await supervised tasks and record terminal or unknown outcomes where possible.
+5. Flush persistence and diagnostics within configured deadlines.
+6. Exit and report incomplete cleanup when possible.
 
-pub struct Uninitialized;
-pub struct Initialized;
-```
+Crash recovery is distinct from graceful shutdown. A crash may prevent cleanup and diagnostics; recovery inspects owned workers before re-enabling dispatch and records unresolved outcomes as unknown unless trustworthy evidence establishes otherwise.
 
-Required fields are enforced at `build()` time:
+## Construction and enforcement
 
-```rust
-impl InfraHandlesBuilder<Uninitialized> {
-    pub fn build(self) -> Result<InfraHandles<Initialized>, BuildError> {
-        let event_store = self.event_store.ok_or(BuildError::MissingEventStore)?;
-        let panic_sink = self.panic_sink.ok_or(BuildError::MissingPanicSink)?;
-        let actor_registry = self.actor_registry.ok_or(BuildError::MissingActorRegistry)?;
+Required dependency construction and fallible startup/configuration checks are required. No builder style is mandated. Required-field presence must be checked, and present configuration must also be semantically validated. An optional typestate wrapper may improve API ergonomics but is not an M1 requirement and does not prove runtime availability.
 
-        Ok(InfraHandles { event_store, panic_sink, actor_registry, _state: PhantomData })
-    }
-}
-```
+Readiness and dispatch admission are runtime states that depend on successful startup, recovery, current persistence health, and policy checks. A type-state token alone cannot enforce that state across asynchronous operations or external process lifetimes.
 
-**Consequences:**
+## Diagnostics and shutdown tokens
 
-**Positive:**
-- **Build-time errors**: Missing required fields are caught at `build()`, not runtime
-- **No `unwrap()` in runtime code**: All `Option` fields resolved during startup
-- **Shutdown ordering enforced**: `InfraHandles<Initialized>` guarantees all components exist
-- **Self-documenting**: Builder API makes required vs optional fields explicit
+Diagnostics, including panic hooks, are best-effort. They may fail to allocate, write, flush, or run during abort or forced process termination. No zero-loss guarantee is made.
 
-**Negative:**
-- **Startup boilerplate**: Builder adds ~50 lines of code
-- **Type complexity**: `InfraHandles<Initialized>` vs `InfraHandles<Uninitialized>` are different types
-- **Ergonomics**: Must call `.build()?` even when all fields are provided
+Do not perform blocking/asynchronous shutdown fallback in `Drop`, and do not panic in `Drop` to enforce shutdown. Consuming a shutdown token does not automatically suppress its `Drop` implementation; Rust still drops a consumed value at function exit unless its design explicitly handles that behavior. `#[must_use]` can warn callers about an unused value but is diagnostic assistance, not execution enforcement or a guarantee that shutdown ran. The shutdown coordinator must explicitly await shutdown and handle errors/timeouts.
 
-**Alternatives Considered:**
+## Consequences
 
-1. **Direct construction**: `InfraHandles { event_store, panic_sink, actor_registry }` → allows missing fields
-2. **Runtime validation**: Check for `None` at runtime → panics are delayed, not prevented
-3. **Macro-generated builder**: Reduces boilerplate but harder to debug
+### Positive
 
-**Implementation Notes:**
+- Startup failures and runtime readiness are explicit and fallible.
+- Dispatch admission can be gated on recovery, current persistence, and policy state.
+- Shutdown and crash-recovery responsibilities are separated.
+- Bounded deadlines make cleanup limitations explicit without claiming external processes stop when a future is dropped.
 
-**Shutdown ordering invariant:**
+### Trade-offs
 
-The typestate builder ensures that `panic_sink` is **always** present when actors are running. During shutdown:
+- Timeouts, resource limits, deployment topology, and worker ownership rules remain to be selected and validated.
+- Forced termination can leave an unknown execution outcome and lost diagnostics.
+- Startup checks cannot guarantee ongoing availability.
 
-1. Actors drain mailboxes and exit
-2. `InfraHandles::shutdown()` flushes `panic_sink` **after** all actors exit
-3. Panics in the final moments of actor lifecycle are captured
+## Revision note
 
-**Test:**
+This revision supersedes compile-time startup/shutdown guarantees, the requirement for a distributed actor registry, the runtime-in-`Drop` fallback, panic-on-drop shutdown-token example, and claims that typestate ensures runtime I/O or panic-sink success. The original decision date is retained.
 
-```rust
-#[tokio::test]
-async fn panic_log_sink_outlives_actors() {
-    let handles = InfraHandlesBuilder::new()
-        .event_store(event_store)
-        .panic_sink(panic_sink.clone())
-        .actor_registry(registry)
-        .build()
-        .unwrap();
+## References
 
-    // Spawn actors
-    let actor = spawn_actor(&handles);
-    actor.send_panic_trigger().await;
-
-    // Shutdown
-    handles.shutdown().await;
-
-    // Verify panic was logged
-    assert!(panic_sink.logs().contains("panic"));
-}
-```
-
-## Drop Guard for Shutdown Ordering
-
-The shutdown ordering contract ("actors drain, then panic_sink flushes") must be enforced even if `.shutdown().await` is bypassed:
-
-```rust
-impl Drop for InfraHandles {
-    fn drop(&mut self) {
-        // If shutdown() was never called, force it now as a last resort
-        if !self.shutdown_called.load(Ordering::SeqCst) {
-            tracing::error!(
-                "InfraHandles dropped without calling shutdown() - forcing shutdown now"
-            );
-            
-            // Block on shutdown in a new thread (can't use async in Drop)
-            std::thread::spawn({
-                let handles = self.clone();  // Requires Arc-wrapped internals
-                move || {
-                    let runtime = tokio::runtime::Runtime::new().unwrap();
-                    runtime.block_on(async {
-                        handles.shutdown_impl().await;
-                    });
-                }
-            }).join().ok();
-        }
-    }
-}
-
-impl InfraHandles {
-    pub async fn shutdown(&self) {
-        self.shutdown_called.store(true, Ordering::SeqCst);
-        self.shutdown_impl().await;
-    }
-
-    async fn shutdown_impl(&self) {
-        // TaskTracker ensures all actors join before dropping panic_sink
-        self.task_tracker.close();
-        self.task_tracker.wait().await;
-        // panic_sink Arc is dropped after all tasks complete
-    }
-}
-```
-
-**Alternative (simpler):** Use a `#[must_use]` shutdown token pattern:
-
-```rust
-pub struct ShutdownToken {
-    handles: Arc<InfraHandles>,
-}
-
-impl ShutdownToken {
-    #[must_use]
-    pub async fn shutdown(self) {
-        self.handles.shutdown_impl().await;
-        // self is consumed - Drop won't run
-    }
-}
-
-impl Drop for ShutdownToken {
-    fn drop(&mut self) {
-        panic!("ShutdownToken dropped without calling .shutdown() - shutdown ordering violated!");
-    }
-}
-```
-
-**Rationale:** Relying on convention (calling `.shutdown()`) is fragile. A `Drop` guard or `#[must_use]` token enforces shutdown ordering at the type level, preventing panic-log loss even if the caller bypasses the shutdown method.
-
-**References:**
-
-- [runtime.md](../runtime.md) — Startup typestate and shutdown ordering
-- [testing.md](../testing.md) — Shutdown ordering test (Task #19)
+- [Runtime architecture](../runtime.md) — proposed readiness, worker recovery, and bounded shutdown.
+- [ADR-003](ADR-003-fail-closed-governance.md) — authorization and execution-time enforcement.

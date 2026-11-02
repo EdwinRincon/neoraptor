@@ -1,351 +1,117 @@
 # NEORAPTOR Architecture
 
-NEORAPTOR is an autonomous offensive-security control plane built on event-sourced runs, bounded queues with backpressure, and typed tool orchestration. This document provides a high-level overview of the system architecture, core boundaries, and key invariants.
+## Purpose and status
 
-For detailed implementation specifics, see the linked documents below.
+NEORAPTOR is a scaffold. The architecture and controls in this document are proposed designs, not implemented or independently verified capabilities. The product direction is governed offensive-security orchestration with reviewable execution and evidence. This restricted v0.1 milestone is one local-fixture workflow, not the complete long-term product.
 
-## Purpose
+See [product direction](product.md) for the destination and hypotheses, [milestones](plan/INDEX.md) for gated capability scope, [current status](plan/STATUS.md) for verified repository evidence, and the [canonical M1 protocol](m1-protocol.md) for selected deployment and execution decisions.
 
-NEORAPTOR orchestrates autonomous security testing operations through a strict separation of trusted control-plane logic and untrusted execution-plane sandboxes. The system:
+The design aims to provide operators with visible plans, action rationales, tool calls, results, and evidence links. It does not promise access to complete model-internal reasoning, production safety, complete vulnerability coverage, or superiority to other products.
 
-- Accepts operator intent (scope, targets, objectives)
-- Plans typed vulnerability probes with full audit trails
-- Executes tools in isolated sandboxes with output caps
-- Captures evidence, confirms findings, and synthesizes attack chains
-- Presents results through event streams and a coverage-mapped UI
+## Proposed v0.1 scope
 
-**Core principles:**
+One authenticated operator in a controlled deployment can initiate a run for one dedicated local HTTP test fixture on an isolated test network. The request names an operator-configured fixture identifier; only trusted configuration maps that identifier to an approved endpoint. Neither the request nor a planner can redefine the endpoint.
 
-- **Event-sourced runs**: Every action produces an immutable `RunEvent`. The event log is the source of truth.
-- **Fail-closed governance**: `ScopeContract` violations abort at planning time, never at execution time.
-- **Typed tool families**: Probe specifications are typed, versioned, and validated — no raw shell generation in the control plane.
-- **Operator-visible reasoning**: Why this tool, why this path, why this finding — all traceable and replayable.
-- **Backpressure and shedding**: Bounded mailboxes and typed priority shedding prevent unbounded growth while preserving critical work.
+The single supported capability is a predefined, read-only HTTP observation check. There are no arbitrary URLs or shell commands, public targets, exploitation, brute force, credential attacks, lateral movement, autonomous escalation, multi-agent attack chains, automatic redirects, or automatic target-facing retries. An HTTP observation can still produce server-side effects such as access logs; zero target-side effects are not guaranteed. Local fixtures are not automatically trusted or safe.
 
-### Trust Boundary: Control Plane ↔ Execution Plane
-
-**Design: executor-contract Crate**
-
-To prevent control-plane domain details from leaking into untrusted sandbox-facing code, a dedicated `executor-contract` crate defines the IPC boundary:
-
-- **executor-contract**: Contains only `SandboxRequest` and `SandboxResponse` types
-- **agents-core**: Remains in the control plane; `ProbeSpec<P, V>` semantics stay internal
-- **Conversion at boundary**: Control plane converts `ProbeSpec` to `SandboxRequest` before crossing the trust boundary
-
-**Benefit:** Tight coupling is eliminated, and IPC evolution becomes easier without exposing control-plane domain logic to sandbox code.
-
-## System Structure
-
-NEORAPTOR is organized into two planes.
-
-### Control Plane (Trusted)
-
-The control plane runs operator-facing services and orchestration logic. It **never** executes untrusted tools directly.
-
-**Responsibilities:**
-- Accept and validate operator requests
-- Enforce `ScopeContract` on every state transition
-- Plan typed `ProbeSpec` instances
-- Validate findings and approve escalations
-- Apply bounded-queue backpressure and priority-based shedding
-- Emit events to the append-only event store
-- Serve SSE streams and UI state
-
-**Key components:**
-- `neoraptor-api`: HTTP endpoints, SSE streams, startup wiring
-- `neoraptor-orchestrator`: Flow lifecycle, policy enforcement
-- `neoraptor-planner`: Typed autonomy loop (planners, validators)
-- `agents-core`: Domain primitives (`RunEvent`, `ScopeContract`, `ProbeSpec`, `EvidenceArtifact`)
-- `neoraptor-event-store`: Append-only event persistence with versioned migrations
-- `error-core`: Shared error types across planes
-
-### Execution Plane (Sandboxed)
-
-The execution plane runs untrusted security tools in isolated environments.
-
-**Responsibilities:**
-- Execute tool commands in sandboxes
-- Stream output with per-artifact size caps (10 MB default)
-- Return evidence and error signals to the control plane
-- Enforce resource limits (CPU, memory, network, time)
-
-**Key components:**
-- `neoraptor-executor`: Actor that owns sandbox lifecycle
-- `neoraptor-sandbox`: Isolation primitives (Docker, gVisor, Firecracker in v0.2+)
-- `neoraptor-tools`: Typed tool family definitions
-
-**Trust boundary:** The control plane treats all execution-plane output as untrusted. Size caps, sanitization, and validation happen before events are written.
-
-## Core Domain Model
-
-The domain model is defined in `agents-core` and shared across both planes.
-
-### `RunEvent`
-
-The atomic unit of state. Every action in the system produces a `RunEvent` (for example, `TargetDiscovered`, `ProbeDispatched`, `FindingConfirmed`, `EscalationTransitioned`). Events are:
-
-- Immutable and append-only
-- Linked to a `ScopeContract.authorization_id`
-- Versioned via `VersionedRunEvent` envelopes for schema evolution
-- Replayable to reconstruct system state at any point in time
-
-**See:** [domain-model.md](./domain-model.md) for event schema details and versioning patterns.
-
-### `ScopeContract`
-
-The cryptographic safety boundary for authorized actions. Defines allowed targets, domains, protocols, time windows, tool families, and disallowed operations.
-
-**Invariants:**
-- Evaluated on **every** state transition in the control plane
-- Violations fail closed at planning time (before probe dispatch)
-- Not `Clone` — constructed only via `ScopeContractBuilder` at startup
-- Shared across async boundaries via `Arc<ScopeContract>` only
-- Missing `allowed_targets` is a hard startup failure
-
-**See:** [security.md](./security.md) for enforcement semantics and governance model.
-
-### `ProbeSpec<P, V>`
-
-A typed request to execute a specific tool (for example, `PortScanProbe`, `SqlInjectionProbe`). Encodes:
-
-- Vulnerability class via phantom type `P`
-- Fingerprint schema version via const generic `V`
-- Target, preconditions, tool family, expected evidence
-
-**Why typed?** Cross-version deduplication becomes a compile-time type mismatch rather than a runtime logic error, and planners and validators can reason about probes before execution and after return for “why this probe” traceability.
-
-**See:** [domain-model.md](./domain-model.md) for `ProbeSpec` typestate and fingerprint versioning.
-
-### `EvidenceArtifact`
-
-Structured evidence from tool execution: command output, parsed vulnerabilities, HTTP transactions, or file captures. Always linked to:
-
-- Source `RunEvent`
-- Tool family and version
-- Size and truncation metadata
-- Streaming ingestion path (never assuming full unbounded buffering)
-
-
-**See:** [domain-model.md](./domain-model.md) for artifact lifecycle and evidence graph modeling.
-
-## Key Invariants
-
-These constraints must always hold and are enforced at compile time or startup:
-
-1. **Control plane never executes tools directly.** Tool execution happens only in the execution plane via `neoraptor-executor` actors.
-2. **Execution plane cannot mutate governance state.** Only the control plane writes events; sandboxes return output via bounded streams.
-3. **Event log is append-only.** No deletes, no in-place updates. Schema changes use versioned migrations and `VersionedRunEvent` envelopes.
-4. **ScopeContract violations fail closed.** Planning aborts before dispatch; execution-plane output violating scope is logged but not acted upon.
-5. **Typed probes prevent cross-version fingerprint collisions.** `ProbeSpec<P, const V: u32>` ensures deduplicator type mismatches across schema versions.
-6. **Output caps are non-negotiable.** 10 MB per artifact, 100 MB per run (configurable). Exceeded caps trigger truncation and warning events.
-7. **Panic-log sink outlives all actors.** Shutdown ordering ensures panics are never lost (see `runtime.md` for supervisor and logging actor lifetimes).
-8. **Startup invariants are enforced via typestate builder.** Runtime code runs with all invariants pre-validated (see `runtime.md`).
-9. **Bounded queues with typed shedding.** All actor mailboxes are bounded, and priority-based eviction preserves critical work under load (ADR-004).
-10. **Snapshots bound replay cost.** Snapshot strategy ensures restart cost is \(O(\text{events since last snapshot})\), not \(O(\text{all events})\) (ADR-001).
-
-## Workflow: End-to-End Run
-
-A typical NEORAPTOR run follows this flow:
-
-1. Operator submits intent via API (`POST /runs` with scope and targets).
-2. Control plane validates scope, constructs `ScopeContract`, writes `RunInitiated`.
-3. Planner generates typed probes and emits `ProbeDispatched` events.
-4. Executor receives probes, spawns sandboxes, and streams tool output with caps.
-5. Validator confirms findings and writes `FindingConfirmed` or `FalsePositive`.
-6. ChainPlanner synthesizes attack chains and proposes escalations.
-7. Mentor reviews escalations, approves or disputes, writes `EscalationTransitioned`.
-8. Supervisor monitors actors, handles panics, coordinates shutdown.
-9. UI consumes event streams and renders coverage maps and attack paths.
-
-**See:** [runtime.md](./runtime.md) for actor roles, backpressure strategy, and supervision.
-
-## Crate Map
+The intended vertical slice is:
 
 ```text
-crates/
-├── api/                  (HTTP, SSE, startup wiring)
-├── orchestrator/         (Flow lifecycle, policy enforcement)
-├── planner/              (Typed autonomy loop)
-├── executor/             (Sandbox lifecycle)
-├── agents-core/          (Core primitives: RunEvent, ScopeContract, ProbeSpec, EvidenceArtifact)
-│                         (Design: Keep ONLY truly universal types; move domain-specific models to subcrates and re-export selectively)
-├── event-store/          (Append-only persistence with versioned migrations)
-├── sandbox/              (Isolation primitives)
-├── tools/                (Typed tool family definitions)
-├── executor-contract/    (IPC types for sandbox boundary: SandboxRequest, SandboxResponse)
-├── error-core/           (Control-plane error types; to be split per-domain)
-└── ui/                   (Coverage map, event stream viewer)
+Authenticated API request
+  -> ProbeRequest
+  -> structural validation
+  -> ScopePolicy evaluation
+  -> durable ExecutionAttempt intent
+  -> live dispatch to trusted execution broker
+  -> acquire execution claim / active slot
+  -> authoritative final permission check
+  -> restricted worker launch
+  -> bounded artifact capture
+  -> CheckResult and separate evidence-completeness status
+  -> rebuildable run projection and minimal inspection UI
 ```
 
-**See:** [domain-model.md](./domain-model.md) for `agents-core` internals.
+A durable intent must be recorded before target-facing work. If persistence fails, new execution is blocked. On restart, replay reconstructs state and must never invoke the executor; an unresolved attempt is recorded as outcome unknown and is not automatically redispatched.
 
-## Error Handling
+Every operator API request requires the selected bearer authentication; controlled network placement is not a substitute. M1 permits only one active target-facing attempt at a time. The browser client and credential flow are summarized in [frontend.md](frontend.md) and specified in the [M1 protocol](m1-protocol.md).
 
-**Design Evolution: Per-Domain Error Crates**
+## Proposed logical boundaries
 
-The current `error-core` crate is shared across unrelated domains (control plane, execution plane, API). This forces broad recompilation when any error variant changes.
+These are logical responsibilities, not a required distributed-actor or crate layout. M1 selects a dedicated Linux VM with a non-root control service and a separate privileged broker process.
 
-**Recommended architecture:**
+- **Control plane:** Authenticates every operator API request with the selected bearer credential, creates a run-specific immutable `ScopePolicy` revision, validates request structure, evaluates policy, records accepted domain events, and serves the static client and minimal inspection interface. Multi-tenant security is not designed here.
+- **Trusted execution broker:** Receives a distinct live dispatch command after durable intent. It acquires the deployment execution slot, claims the attempt, and performs the authoritative final permission check against the exact request, policy, fixture-configuration revision, and relevant execution-configuration revision before launching the restricted Docker worker. Its socket and caller boundary are specified in the canonical protocol. The broker is privileged and security-sensitive; it is not the untrusted tool sandbox.
+- **Tool process/container:** Runs the single predefined HTTP observation check with restricted resources and egress. Its output and status messages are untrusted reports, not authoritative event writes or policy decisions.
+- **Persistence:** PostgreSQL is selected for event history, metadata, coordination, and bounded artifact chunks. This is a proposed design; database roles, constraints, and durability assumptions are not implemented or independently verified.
+- **Inspection UI:** A statically built SvelteKit client served by Rust presents bounded projections, attempt outcomes, readiness, and evidence. It treats raw artifacts as untrusted data and renders them inertly.
 
-- Split `error-core` into per-domain error crates:
-  - `planner-errors` — Planning and orchestration errors
-  - `executor-errors` — Sandbox and tool execution errors
-  - `validator-errors` — Finding validation and false-positive filtering errors
-- Convert errors at the `api` composition boundary using `From` implementations
-- Keep `anyhow` usage confined to `api/` composition and HTTP boundaries
+## Trust and data flow
 
-This approach decouples error evolution across domains and reduces unnecessary recompilation.
-
-**Current shared error approach:**
-
-Cross-cutting error types (I/O, sandbox, policy) are shared via `error-core` using `thiserror` + `From` conversions.
-
-**Control plane–execution plane boundary:**
-
-```rust
-#[derive(Debug, thiserror::Error)]
-pub enum ExecutorError {
-    #[error("Policy violation: {0}")]
-    PolicyViolation(PolicyViolation),
-
-    #[error("Resource exhausted: {kind}")]
-    ResourceExhausted { kind: ResourceKind },  // Zero-allocation enum instead of String
-
-    #[error("Timeout after {elapsed:?}")]
-    Timeout { elapsed: Duration },
-
-    #[error("Sandbox failure: {kind}")]
-    SandboxFailure { kind: SandboxFailureKind },  // Structured enum instead of stringly-typed
-
-    #[error("I/O error: {0}")]
-    Io(#[from] std::io::Error),
-}
-
-pub enum ResourceKind {
-    Memory,
-    Cpu,
-    Disk,
-    Network,
-    Timeout,
-}
-
-pub enum SandboxFailureKind {
-    SpawnFailed,
-    StreamInterrupted,
-    ExitCodeNonZero,
-    OutputMalformed,
-    ProcessKilled,
-}
-
-type ExecutorResult = Result<EvidenceArtifact, ExecutorError>;
+```mermaid
+flowchart LR
+    operator["Operator browser"] -->|SSH tunnel; bearer header| ui["Static SvelteKit client"]
+    ui --> api["Rust control service"]
+    api --> policy["Run + ScopePolicy"]
+    api --> request["ProbeRequest"]
+    request --> validation["Structural validation + policy evaluation"]
+    validation --> live["Live coordinator"]
+    live -->|transaction: intent + slot + idempotency| pg["PostgreSQL"]
+    live -->|post-intent live dispatch| broker["Trusted execution broker"]
+    broker -->|claim + final check transaction| pg
+    pg --> finalcheck["Committed launch authorization"]
+    finalcheck -->|launch| worker["Restricted Docker worker"]
+    broker -->|cancel / inspect / stop| worker
+    worker -->|approved endpoint only| fixture["Dedicated local HTTP fixture"]
+    worker -->|untrusted report/output| ingest["Bounded ingestion"]
+    ingest -->|chunks + finalization transaction| pg
+    pg --> projection["Rebuildable run projection"]
+    projection --> ui
+    replay["Restart replay / projection rebuild"]
+    pg -->|accepted events only| replay
+    replay -->|projection writes only| pg
 ```
 
-**Rationale:** 
-- `ResourceExhausted` with `String` allocates on the hot error path. Using a `ResourceKind` enum eliminates avoidable heap allocation in sandbox failure loops.
-- `SandboxFailure(String)` loses structured matching and incurs heap allocation during common sandbox failure cases. Replacing with `SandboxFailure { kind: SandboxFailureKind }` enables precise error handling and preserves pattern-matching capability.
+The diagram describes a proposed boundary, not a deployed system. Intent is durably committed with admission/slot/idempotency state before separate live dispatch. The broker claim and final permission check are defined in the [M1 protocol](m1-protocol.md); the database/OS mechanisms remain unimplemented. Replay reads accepted facts to rebuild projections and cannot launch or contact targets. The fixture endpoint and execution configuration are fixed by trusted revisions; a change requires reevaluation. Docker alone does not enforce the allowlist. Inspect default-deny configuration and run representative negative reachability tests at the selected network boundary; those tests do not prove every possible destination unreachable.
 
-The concrete `ExecutorError` enum preserves pattern-matching capability for policy violations, resource exhaustion, and timeouts across IPC boundaries.
+## Authorization sequence
 
-**Policy:**
-- **Transient** (network, resource): retry with exponential backoff
-- **Permanent** (validation, policy): fail immediately, log, emit `ProbeFailed`
-- **Panic** (logic bug): captured by supervisor, logged, escalated to operator
+Structural validation checks syntax, bounds, the supported check type, and its parameter schema. It does not grant authorization. Policy evaluation decides whether the exact request is permitted by a specific immutable `ScopePolicy` revision. Approval binds that exact request to the policy, fixture/execution configuration revisions, and approved resource limits; matching run IDs or normalized-request equality alone do not establish the binding. Immediately before target-facing work, the broker rechecks the current policy and revocation state, run state, exact request/approval identity, validity window, resource budget, fixture-configuration revision, and relevant execution-configuration revision using a trusted injectable clock. The selected authentication mechanism is the protected, expiring bearer credential described in the canonical protocol; no credential is claimed implemented.
 
-**Retry Classification:**
+The validity interval is half-open: `valid_from <= now < valid_until`. The conservative 15-second execution timer begins immediately before Docker start is issued, not on a later worker-start acknowledgement; policy expiry is an additional upper bound. See the [M1 protocol](m1-protocol.md) for the combined create/start budget, ambiguous operation handling, and bounded cancellation/shutdown phases. At expiry, initiate cancellation and bounded worker termination; do not imply an instantaneous stop or reversal of prior effects. An explicit timestamp makes policy checks testable but does not prevent time-of-check/time-of-use races. Authorization is per run, not fixed globally at process startup. Creating a new run may create a new policy revision; changing an approved policy creates a new revision rather than mutating its prior meaning. M1 has no waiting execution backlog: reject a distinct new start as busy, and cancel active work on revocation or expiry. A confirmed worker stop may coexist with an unknown execution outcome; retain the slot until stop/absence and required cleanup are established.
 
-To prevent retries from looping on permanent policy violations or failing fast on recoverable timeouts, retryability is encoded via a shared error trait:
+A platform approval record captures the operator's asserted authorization. It does not independently prove legal ownership or permission to test a third-party target. No `Clone` or `Arc` ownership pattern is a security boundary. Private fields can help preserve API invariants but do not replace runtime checks.
 
-```rust
-pub trait Retryable: sealed::Sealed {
-    fn is_retryable(&self) -> bool;
-}
+## Events, recovery, and failure behavior
 
-impl Retryable for ExecutorError {
-    fn is_retryable(&self) -> bool {
-        match self {
-            Self::ResourceExhausted { .. } => true,   // Transient
-            Self::Timeout { .. } => true,              // Transient
-            Self::SandboxFailure { kind } => {
-                matches!(kind, 
-                    SandboxFailureKind::StreamInterrupted | 
-                    SandboxFailureKind::ProcessKilled
-                )
-            },
-            Self::PolicyViolation(_) => false,         // Permanent
-            Self::Io(_) => true,                       // Potentially transient
-        }
-    }
-}
+Domain events record facts; replay applies facts to rebuild an explicitly derived projection and never launches workers, contacts targets, issues dispatch commands, or changes authorization. Rebuilding the projection store is permitted; it is not a second authority. A durable per-run sequence, not timestamps alone, establishes event order. PostgreSQL is selected; expected-revision/row-lock transaction requirements and durability limits are detailed in the canonical protocol and ADR-001. A dispatch-intent event records an intention, not proof that a worker started. Worker reports pass through authenticated control-plane ingestion and are validated before accepted events are appended.
 
-impl Retryable for PlannerError {
-    fn is_retryable(&self) -> bool {
-        match self {
-            Self::CoverageMapUnavailable => true,     // Transient
-            Self::ScopeViolation(_) => false,         // Permanent
-            // ...
-        }
-    }
-}
-```
+If required persistence fails, stop new dispatch and trigger cancellation of active work under bounded termination; a failure event itself may not be persistable. On restart, reconcile workers owned by this deployment before dispatch is reenabled. Unresolved cleanup prevents new target execution. An unresolved dispatch intent is `OutcomeUnknown` unless explicit reconciliation evidence establishes its status. Reconciliation appends a new fact with actor identity and evidence; it does not overwrite the unknown-outcome event. Late worker reports cannot silently overwrite accepted history. v0.1 has no automatic target-facing retry. A manual retry requires explicit authorization and creates a new attempt while preserving prior history. Do not claim exactly-once or at-most-once external execution.
 
-All backoff code consumes the `Retryable` trait uniformly, preventing retry decisions from drifting across layers.
+## Evidence and findings
 
-**See:** [runtime.md](./runtime.md) for panic handling and escalation typestate.
+Separate the live worker stream, bounded ingestion, persisted artifact bytes, and `ArtifactMetadata` referenced by events. The selected PostgreSQL chunk-staging/finalization protocol and proposed 10 MiB per-artifact and 100 MiB per-run caps are detailed in the [M1 protocol](m1-protocol.md) and [ADR-005](adr/ADR-005-output-size-caps.md). M1 permits one active target-facing attempt at a time, but ingestion/accounting must still remain correct under concurrency and recovery. A stream ending normally exactly at its cap may be complete. Observed excess is not retained; it marks capture incomplete, initiates attempt termination, and requires bounded cleanup. Incomplete evidence is distinct from an unknown execution outcome and cannot confirm a finding. Finding validation remains future capability.
 
-**Note on Implementation Alignment:**
+Raw output, target pages, retrieved documents, and artifacts remain untrusted data, even after a finding is validated. Preserve raw capture separately from any sanitized/redacted view. A digest can detect mismatch against a trusted expected digest; it does not establish provenance or prevent a privileged attacker from rewriting both content and metadata. An HTTP observation is not itself a security finding; finding validation requires explicit check-specific criteria and may be inconclusive. Any future target-facing validation action is a new action subject to authorization and execution controls.
 
-The architecture described here represents the intended design. For verification that the live codebase matches these documented boundaries:
-- Audit the actual module tree in `crates/agents-core/src/` to confirm domain-specific types have been moved to subcrates
-- Check `crates/` layout to verify error-core split into per-domain crates
-- Validate that concrete Rust signatures align with the ownership and borrowing patterns described here
+## Verification requirements
 
-## Observability
+The designs are requirements, not claimed passing tests. Before executing against even the local fixture, verify at minimum:
 
-NEORAPTOR emits:
+| Requirement | Acceptance evidence |
+|---|---|
+| Permitted fixture execution | The configured fixture identifier reaches only the approved fixture. |
+| Destination/capability denial | Other destinations and unsupported checks are rejected before worker invocation. |
+| Request integrity | A changed request requires fresh authorization. |
+| Expiry/revocation | Pre-launch permission failure is denied by the broker; expiry/revocation during execution initiates cancellation and bounded termination. |
+| Persistence/recovery | Persistence failure blocks dispatch; crash after intent recovers as unknown; replay makes zero executor calls. |
+| Duplicate handling | Duplicate request/attempt submissions follow explicit idempotency rules and do not silently create extra execution. |
+| Evidence limits | Per-artifact and aggregate run caps hold under concurrent capture; incomplete observations are explicit, distinct from execution outcome, and cannot alone confirm a finding. |
+| Shutdown/rendering | Shutdown meets its deadline with worker cleanup attempted; raw artifact rendering is safe. |
 
-- Metrics: probe dispatch rate, finding confirmation rate, sandbox spawn latency, queue depth
-- Traces: distributed tracing for run → probe → finding lineage
-- Logs: structured JSON logs with run, probe, and actor IDs
-- Events: all state changes captured as `RunEvent` in the event log
+See [security.md](./security.md), [domain-model.md](./domain-model.md), [runtime.md](./runtime.md), and the [proposed testing strategy](./testing.md) for corresponding boundaries and verification requirements.
 
-**See:** [observability.md](./observability.md) for metrics catalog and degradation signals.
+## Longer-term product direction and deferred work
 
-## Security Model
+Broader authorized testing remains the product direction, gated on security and reliability acceptance criteria. Additional targets, tools, agent/planner autonomy, escalation, chain planning, coverage models, snapshots, event migrations, advanced sandbox backends, and external integrations are deferred; none is a mandatory v0.1 workflow step. Domain/CIDR canonicalization and destination-resolution policy require a separate design before those target types are considered.
 
-**Trust boundaries:**
-- Control plane (trusted) vs execution plane (untrusted)
-- Operator input (semi-trusted) vs sandbox output (untrusted)
-- Event store (append-only, trusted) vs tool artifacts (untrusted until validated)
-
-**Enforcement points:**
-- `ScopeContract` validation before every planning decision
-- Output size caps on all sandbox streams
-- Schema and size validation on all external inputs (API, tool output) before event append
-
-**See:** [security.md](./security.md) for sandbox guarantees and audit model.
-
-## Testing Strategy
-
-- Unit tests: domain logic, typestate transitions, error paths
-- Integration tests: event replay across version boundaries, actor supervision
-- Macro snapshot tests: trait-variant macro stability (see [testing.md](./testing.md))
-- CI: `cargo check`, `clippy`, `deny`, and `test` on every commit
-
-**See:** [testing.md](./testing.md) for test layout and CI entrypoints.
-
-## Further Reading
-
-- [domain-model.md](./domain-model.md) — Deep dive on `RunEvent`, `ScopeContract`, `ProbeSpec`, evidence graph
-- [runtime.md](./runtime.md) — Actor roles, backpressure, supervision, shutdown ordering
-- [security.md](./security.md) — `ScopeContract` enforcement, sandbox guarantees, governance
-- [observability.md](./observability.md) — Metrics, traces, coverage signals, heap health
-- [testing.md](./testing.md) — Testing strategy, macro stability, CI layout
-- [adr/](./adr/) — Architecture decision records for major design choices
-
-## Version Scope
-
-**v0.1.0** is intentionally limited to one end-to-end vertical slice:
-
-API → typed intent → sandboxed tool execution → event log and artifacts → minimal UI and audit
-
-Firecracker, graph projections, advanced chain planning, and full OTEL/Langfuse support remain v0.2+. The initial implementation validates trust boundaries, backpressure, output caps, retry policy, shutdown behavior, and schema evolution before expanding scope.
+Logical modules may be separated later, but no crate layout is prescribed here. The [M1 protocol](m1-protocol.md) records selected mechanisms and remaining deployment-specific closure. This architecture is a summary; [testing](testing.md), [observability](observability.md), and the reviewed [ADR index](adr/README.md) provide the related proposed requirements.
