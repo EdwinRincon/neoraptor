@@ -1,115 +1,69 @@
-# ADR-001: Event Sourcing as Foundation
+# ADR-001: Event Sourcing for Authoritative Run Facts
 
 **Status:** Accepted
 
 **Date:** 2026-05-31
 
-**Context:**
+## Context
 
-NEORAPTOR orchestrates potentially destructive security testing operations across multiple actors, sandboxes, and external systems. We need a reliable way to:
+NEORAPTOR needs to represent run lifecycle and execution facts so current run state and operator-facing views can be reconstructed. The repository is a scaffold; persistence and recovery are design choices, not implemented capabilities.
 
-1. Reconstruct system state at any point in time for replay and debugging
-2. Provide full audit trails for compliance and operator accountability
-3. Support schema evolution without breaking existing data
-4. Enable cross-version compatibility for long-running operations
+The historical proposal assumed a multi-actor assessment system, full audit guarantees, PostgreSQL, and snapshots. This revision retains PostgreSQL for M1, but not the historical schema, audit guarantees, or snapshot requirements.
 
-**Decision:**
+## Decision
 
-We will use event sourcing as the foundational data model. All state changes are captured as immutable `RunEvent`s in an append-only log. System state is derived by replaying events.
+Use an event-sourced model for authoritative run lifecycle and execution facts. Accepted events are the authoritative recorded domain history; projections are derived views and may be rebuilt from that history. Immutable policy/configuration, approval, revocation, idempotency, broker-claim, worker-ownership, and active-slot records are separate authoritative configuration or operational coordination state; the event history alone does not recreate live lock ownership.
 
-**Consequences:**
+Persisted events must carry an explicit schema version from the first stored event. Event replay applies recorded facts only: it must not launch workers, contact targets, issue dispatch commands, or change authorization. Replay may rebuild explicitly derived projection storage.
 
-**Positive:**
-- Complete audit trail: every action is traceable to an event
-- Time-travel debugging: replay events to any point in time
-- Schema evolution via versioned migrations (`VersionedRunEvent`)
-- Natural fit for actor-based systems (events flow between actors)
-- Replayability enables testing and validation of complex workflows
+An event indicating dispatch intent records intent, not proof that a worker started. Worker reports become accepted facts only through the authorized control-plane ingestion path. A later reconciliation adds a new fact and preserves a previously recorded unknown outcome rather than overwriting history.
 
-**Negative:**
-- Event log grows unbounded (mitigated by archival strategy in v0.2+)
-- Replay can be slow for large event logs (mitigated by snapshots in v0.2+)
-- Schema migrations add complexity (migration chain must be tested)
-- CQRS (Command Query Responsibility Segregation) required for read-heavy queries
+This decision does not guarantee append-only storage, establish tamper resistance, or promise a complete audit trail.
 
-**Alternatives Considered:**
+## Consequences
 
-1. **Traditional CRUD database**: Simpler but loses audit trail and time-travel capability
-2. **Hybrid (CRUD + audit log)**: Audit log separate from state; prone to drift between log and state
-3. **Change data capture (CDC)**: Event log derived from database changes; tightly couples to database schema
+### Positive
 
-**Implementation Notes:**
+- Run state and explicitly derived projections can be reconstructed from recorded facts.
+- Causation, policy revision, request, and attempt references can support review of how recorded outcomes arose.
+- A projection can be rebuilt without treating it as an independent authority.
 
-- Event store is SQL-based (PostgreSQL) for durability and query capability
-- Events are wrapped in `VersionedRunEvent` envelopes for schema evolution
-- Migration chain is tested via integration tests (see `tests/event_replay.rs`)
-**v0.1 Snapshot strategy**: Prevents O(n) replay cost on every restart
+### Trade-offs
 
-**RunStateSnapshot (CQRS read model for v0.1):**
+- Event schema and consistency rules must be maintained as the model evolves.
+- Recovery cost depends on the events and projection state that must be read and applied.
+- A stored event history alone does not establish truth, completeness, provenance, or tamper resistance.
+- Database permissions, transaction enforcement, deployment durability assumptions, retention, and audit requirements require implementation design and verification.
 
-```rust
-// In event-store/src/snapshot.rs
-pub struct RunStateSnapshot {
-    pub run_id: RunId,
-    pub snapshot_at_event_id: EventId, // Last event included in snapshot
-    pub status: RunStatus,
-    pub active_probes: Vec<ProbeId>,
-    pub confirmed_findings: Vec<Finding>,
-    pub escalation_queue: Vec<Escalation>,
-    pub created_at: DateTime<Utc>,
-}
+## M1 persistence selection
 
-impl EventStore {
-    /// Write snapshot after RunCompleted event
-    pub async fn snapshot_run(&self, run_id: RunId) -> Result<(), SnapshotError> {
-        let events = self.get_events(run_id).await?;
-        let last_event_id = events.last().ok_or(SnapshotError::EmptyStream)?.id;
+PostgreSQL is selected for M1 event history, metadata, operational coordination, and bounded artifact chunks. Records authorizing execution require synchronous commits, with `fsync` and full-page writes enabled. Do not prescribe an unreviewed PostgreSQL major version. These settings do not prove that hardware honors flushes, and do not provide backup, replication, disaster recovery, or tamper resistance.
 
-        let state = replay_events(events)?;
+The canonical proposed tables, transaction boundaries, artifact protocol, and failure semantics are in [the M1 protocol](../m1-protocol.md) and [schema.dbml](../../crates/db/schema.dbml). DBML notes do not enforce constraints. The eventual migration and database roles must implement append-only event permissions, immutable revisions, concurrency/slot locking, exact capture accounting, artifact finalization, and recovery rules.
 
-        self.save_snapshot(RunStateSnapshot {
-            run_id,
-            snapshot_at_event_id: last_event_id,
-            status: state.status,
-            active_probes: state.active_probes,
-            confirmed_findings: state.confirmed_findings,
-            escalation_queue: state.escalation_queue,
-            created_at: Utc::now(),
-        }).await
-    }
+Projection rebuilds do not recreate or release live execution claims. Replaying domain facts cannot authorize execution or dispatch a worker.
 
-    /// On restart: load snapshot + replay only subsequent events
-    pub async fn restore_run_state(&self, run_id: RunId) -> Result<RunState, RestoreError> {
-        let snapshot = self.get_latest_snapshot(run_id).await?;
+## Snapshots and projections
 
-        // Validate snapshot consistency (optional but recommended)
-        self.ensure_event_exists(run_id, snapshot.snapshot_at_event_id).await?;
+Snapshots are deferred until measured recovery cost justifies them. A **query projection** is a derived view optimized for inspection; it may be rebuilt and is not authoritative. A **recovery snapshot**, if introduced later, is a checkpoint of state used to reduce replay work; it does not replace the authoritative event history or make recovery cost independent of snapshot size and subsequent events.
 
-        let new_events = self
-            .get_events_after(run_id, snapshot.snapshot_at_event_id)
-            .await?;
+A snapshot reference such as the last included event ID can identify a replay boundary. It is not an integrity proof. Integrity requires a separately designed mechanism and trusted reference.
 
-        let mut state = RunState::from_snapshot(snapshot);
-        for event in new_events {
-            state.apply(event);
-        }
-        Ok(state)
-    }
-}
-```
+## Migration
 
-**Benefits:**
-- Restart cost is \(O(\text{events since last snapshot})\) instead of \(O(\text{all events})\)  
-- For long-running runs (1000s of events), typically only ~10–100 events need replay  
-- Standard CQRS pattern; easily extended to dedicated read models in v0.2+  
-- Snapshot integrity: `snapshot_at_event_id` enables consistency validation on load  
+Recursive migration machinery is deferred. Schema versioning is required from the first persisted event. Any future upcasting must preserve historical meaning and provenance; facts unavailable in an older event remain unknown rather than being invented. No migration tests or implementation are claimed by this decision.
 
-**Snapshot policy (v0.1):**
-- Write snapshot on `RunCompleted` event  
-- Optional: snapshot every \(N\) events (e.g., \(N = 1000\)) for long-running runs  
-- Snapshots are append-only (never updated), enabling time-travel to any snapshot point  
+## Scope and implementation
 
-**References:**
+Event sourcing does not require distributed actors. M1 may use coordinated services and supervised tasks in one process. This ADR records a design decision; it does not claim implementation, passing tests, complete auditability, or compliance capability.
 
-- [domain-model.md](../domain-model.md) — Event schema and versioning
-- [runtime.md](../runtime.md) — How actors produce and consume events
+## References
+
+- [M1 deployment and execution protocol](../m1-protocol.md) — selected persistence, transaction, artifact, and recovery design.
+- [Proposed M1 schema](../../crates/db/schema.dbml) — descriptive DBML; not a migration or enforcement mechanism.
+- [Domain model](../domain-model.md) — proposed event semantics and recovery.
+- [Runtime architecture](../runtime.md) — dispatch, replay, and restart behavior.
+
+## Revision note
+
+This revision resolves the historical PostgreSQL selection for M1 while replacing the obsolete schema assumptions. It supersedes earlier requirements for v0.1 snapshots, recursive `VersionedRunEvent` migration machinery, PostgreSQL schema as previously proposed, full/complete audit guarantees, snapshot-reference integrity, and actor architecture as a consequence of event sourcing. Snapshots remain deferred; query projections remain rebuildable and distinct from recovery snapshots. The original decision date and accepted status are preserved. No PostgreSQL implementation, migration, durability test, or passing result is claimed.

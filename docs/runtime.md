@@ -1,486 +1,111 @@
 # Runtime Architecture
 
-This document describes NEORAPTOR's runtime model: actor roles, control vs execution plane responsibilities, backpressure strategy, supervision, and shutdown ordering.
+## Purpose and status
 
-## Overview
+This document describes a proposed runtime for NEORAPTOR's restricted v0.1 workflow. The repository is a scaffold; actors, queues, workers, persistence behavior, and shutdown guarantees described here are not implemented or verified. Logical roles may initially be ordinary coordinated services and supervised tasks. A distributed actor architecture is not required.
 
-NEORAPTOR runs as a distributed actor system with strict separation between trusted control-plane logic and untrusted execution-plane sandboxes. Actors communicate via typed messages and never share mutable state.
+See [product direction](product.md) for the destination, [milestones](plan/INDEX.md) for staged permissions, [current status](plan/STATUS.md) for repository evidence, and the [canonical M1 protocol](m1-protocol.md) for selected deployment and transaction semantics.
 
-**Core runtime principles:**
+The v0.1 workflow accepts one authenticated operator request for one predefined, read-only HTTP observation against a dedicated local test fixture on an isolated test network. Every API read and mutation requires the selected bearer authentication; controlled network placement does not replace authentication. A trusted configuration maps a fixture identifier to the single approved endpoint and fixed request shape. No arbitrary URLs or commands, public targets, exploitation, brute force, credential attacks, lateral movement, autonomous escalation, chain planning, redirects, or automatic target-facing retries are allowed. The request may still cause server-side effects such as access logging; no zero-side-effect guarantee is made.
 
-1. **Control plane never executes tools directly** — tool execution happens only in sandboxed executors
-2. **Execution plane cannot mutate governance state** — only the control plane writes events
-3. **Backpressure prevents resource exhaustion** — bounded queues with shedding rules
-4. **Panic-log sink outlives all actors** — shutdown ordering ensures no panics are lost
-5. **Startup invariants are enforced via typestate** — runtime code runs with all invariants pre-validated
+## Logical roles and trust boundaries
 
-## Control Plane vs Execution Plane
+- **Control-plane API/coordinator:** Authenticates every operator request using the protected bearer credential, accepts a request, creates/references a run-specific `ScopePolicy` revision, performs structural validation and policy evaluation, and coordinates PostgreSQL state. Multi-tenant security is not designed.
+- **Policy and run-state service:** Determines whether the exact request is allowed by its immutable policy revision and maintains run state from accepted event facts. Policy updates create revisions; they do not mutate a previously approved policy.
+- **Trusted execution broker:** Receives a distinct live dispatch command after durable intent; it does not consume replayed intent as a command. It claims the attempt, checks execution-time permission at the durable launch-authorization commit point, binds to exact request/policy/fixture/execution revisions, resolves the fixture identifier, and launches/stops/inspects the worker. Its privileged Unix-socket boundary and egress/resource requirements are specified in the canonical protocol. It is not an untrusted sandbox.
+- **Restricted Docker worker:** Runs only the predefined HTTP observation check with bounded resources and access to the explicit fixture endpoint. Treat the process, its output, and status messages as untrusted.
+- **Persistence/ingestion:** PostgreSQL is selected for accepted domain events, metadata, coordination, and bounded artifact chunks. Only authenticated control-plane ingestion appends accepted events; worker reports are data, not authoritative writes. The selected durability requirements are not implemented or tested.
+- **Projection/inspection UI:** A static SvelteKit client served by Rust displays bounded authoritative projections, attempt outcomes, readiness, and evidence. It does not expose a promise of complete model-internal reasoning.
 
-### Control Plane (Trusted)
+## Execution sequence
 
-The control plane runs operator-facing services and orchestration logic.
+1. Authenticate the operator at the control-plane boundary and accept the structured request.
+2. Structurally validate syntax, bounds, capability, fixture identifier, and parameter schema. This does not authorize execution.
+3. Evaluate the exact request under a specific immutable `ScopePolicy` revision; record allow or denial. A rejection is not an authorized action.
+4. Ensure startup recovery has inspected workers owned by this deployment. Until ownership-based inspection and required orphan cleanup complete, execution remains disabled.
+5. In one PostgreSQL transaction, lock the singleton deployment slot before resolving/inserting the operator/operation-scoped idempotency key. A conflict-safe unique-key insert followed by rereading the committed row resolves concurrent first use; an absent-row read is not a reservation. Record a stable busy result without future work, or atomically bind approval to the exact request/policy/configuration/resource limits and create the attempt, slot reservation, idempotency result, and durable intent.
+6. Only after commit, issue a distinct live dispatch command. The broker claims the same attempt, performs the authoritative final check under the selected transaction protocol, and records the launch-authorization commit point. A failed pre-launch check blocks execution.
+7. After receiving live dispatch and acquiring the claim, the broker performs the authoritative final check of current policy/revocation, run state, exact request and its approval, half-open validity, budget, fixture mapping/revision, and execution configuration/revision. Immediately before container start, the owning broker establishes the monotonic Docker create/start operation deadline and starts the conservative 15-second execution timer before issuing the Docker start call. The effective deadline is bounded by that timer and policy expiry; delayed/lost acknowledgement or later observed start does not extend it. Docker timeouts are ambiguous and require inspection, not an unconditional retry. Cancellation begins immediately when requested and does not wait for runtime expiry. See the [M1 protocol](m1-protocol.md) for phase budgets and lock order.
+8. The broker launches the worker, which may contact only the configured fixture endpoint. Docker namespaces alone do not enforce this allowlist.
+9. Ingest worker output through bounded capture, persist bytes and `ArtifactMetadata`, and record observation availability/completeness separately from execution outcome. A successful HTTP response is not a security finding.
+10. Reconstruct the explicitly derived, rebuildable run projection and UI from accepted events and artifact references. Replay may update projection storage but cannot launch workers, contact targets, issue dispatch commands, or change authorization.
 
-**Responsibilities:**
-- Accept and validate operator requests.
-- Enforce `ScopeContract` on every state transition.
-- Plan typed `ProbeSpec` instances.
-- Validate findings and approve escalations.
-- Emit events to the append-only event store.
-- Serve SSE streams and UI state.
+Authorization is per run, not fixed globally at startup. Creating a new authorized run can create a new policy revision while the process runs. Before launch, a permission failure blocks execution. During execution, policy expiry, revocation, or budget exhaustion initiates cancellation and bounded termination; this is not instantaneous and cannot undo already-produced effects. Retain the active slot until worker stop/absence and required cleanup are established. An unknown outcome does not release a slot if the worker may still be running; a confirmed stop may coexist with an unknown target execution outcome.
 
-**Key actors:**
-- `Orchestrator` — Flow lifecycle coordinator
-- `Planner` — Typed autonomy loop (generates probes)
-- `Validator` — Confirms findings, filters false positives
-- `ChainPlanner` — Synthesizes attack chains, proposes escalations
-- `Mentor` — Reviews and approves/disputes escalations
+## Persistence, crashes, and duplicate handling
 
-**Trust boundary:** Control-plane actors trust each other but **never** trust execution-plane output. All sandbox results are treated as untrusted until validated.
+Persist the required dispatch intent before starting target-facing work. If required persistence fails, stop new dispatch and trigger cancellation of active work under bounded termination; a failure event itself may not be persistable. At capture-cap exceedance, stop retaining bytes, mark capture incomplete, terminate the attempt, and perform bounded stream cleanup. Do not block on pipes or perform unbounded drain/discard work.
 
-### Execution Plane (Sandboxed)
+On startup, the selected broker protocol inspects workers belonging to this deployment before dispatch is reenabled. Unresolved cleanup prevents new target execution. Trustworthy ownership identifiers and orphan handling are required. If the process crashes after intent but before a trustworthy terminal record, recovery marks execution outcome unknown unless explicit reconciliation evidence establishes what happened. Reconciliation appends a new actor-attributed fact and preserves the unknown-outcome event. Late worker reports cannot silently overwrite accepted history. Do not automatically redispatch unresolved work. A manual retry requires fresh explicit authorization, creates a new request/attempt identity and idempotency key, and preserves previous history. Do not claim exactly-once or at-most-once external execution.
 
-The execution plane runs untrusted security tools in isolated environments.
+Durable per-run sequence, not timestamps alone, defines event order. PostgreSQL appends use expected-revision and slot/idempotency transaction requirements in the canonical protocol. Duplicate request/attempt behavior is specified there; the database implementation remains unbuilt. Infrastructure retries may be bounded only when they cannot reissue target-facing actions.
 
-**Responsibilities:**
-- Execute tool commands in sandboxes.
-- Stream output with hard per-artifact size caps (configurable).
-- Return evidence and error signals to the control plane.
-- Enforce resource limits (CPU, memory, network, time).
+Keep event append, live command dispatch, and projection updates distinct: durable events describe facts, while a dispatch command is performed only by the live coordinator after the required checks. Replay cannot launch workers, contact targets, issue dispatch commands, or change authorization; it may rebuild explicitly derived projection storage. A dispatch-intent event alone is never consumed by replay as an instruction to re-execute.
 
-**Key actors:**
-- `Executor` — Owns sandbox lifecycle, dispatches probes
-- `Sandbox` — Isolation primitive (Docker, gVisor, Firecracker in v0.2+)
+## Bounded ingestion and backpressure
 
-**Trust boundary:** Execution-plane output is untrusted. Size caps, sanitization, and validation happen before events are written.
+Separate live worker output, bounded ingestion buffers, PostgreSQL artifact chunks, and `ArtifactMetadata`. The canonical protocol records provisional capture, timeout, and resource defaults; they are not validated safe limits. M1 permits only one active target-facing attempt, while concurrent ingestion/accounting correctness remains required. Reserve/account for the run budget before captures so workers cannot collectively exceed the configured cap. A stream that ends normally at exactly the limit may be complete. When additional data is observed, retain no excess bytes, mark observation evidence incomplete with a reason, initiate attempt termination, and perform bounded stream cleanup. Never use blocking pipes or unbounded discard loops. Observation completeness is independent of whether execution outcome is known.
 
-## Actor Roles
+M1 has no waiting execution backlog. New distinct starts while the active slot is occupied receive a durable, stable busy result without future work; duplicate requests and dispatches follow the idempotency and claim protocol in [m1-protocol.md](m1-protocol.md). Bound internal queue capacity and each payload. Channel closure, send timeout, receiver failure, and saturation have explicit outcomes; an accepted in-memory send is not a durability or processing guarantee. Cancellation uses a dedicated bounded signaling path independent of normal work backlog, and failures of that path are surfaced.
 
-### Orchestrator
+Distinguish four traffic classes:
 
-The `Orchestrator` is the main flow coordinator. It:
+- **Authoritative domain facts and required execution outcomes:** Never silently shed. If persistence is unavailable, stop admitting/dispatching new target-facing work. Do not claim an event can always be written to report a persistence failure.
+- **Execution commands:** Explicitly tracked; sending may fail and receiver closure must be handled. A bounded-channel API or marker trait alone does not ensure delivery or persistence.
+- **Reconstructable UI updates:** May be coalesced or dropped only when projections can be rebuilt from durable facts and this behavior is explicit.
+- **Optional telemetry:** May be sampled/dropped under defined policy; it is not a substitute for authoritative events.
 
-- Receives operator requests via the API
-- Constructs `ScopeContract` instances using the typestate builder
-- Emits `RunInitiated` events
-- Coordinates actor lifecycle (spawn planners, validators, executors)
-- Monitors run status and emits `RunCompleted` or `RunAborted` events
+On required persistence failure, stop new dispatch and request cancellation of active work with bounded termination. Define bounded handling for buffers and incomplete outcomes; the failure event may itself be unwritable. Do not silently shed required execution results.
 
-**Mailbox semantics:** Uses a bounded queue. Exceeding capacity triggers backpressure (see below) instead of unbounded growth.
+## Cancellation and shutdown
 
-**Startup:** Constructed via a builder that enforces required dependencies (event store, scope, registry) before any actors are spawned.
+A graceful shutdown procedure should:
 
-### Planner
+1. Close admission to new work.
+2. Prevent new dispatches.
+3. Persist cancellation/stop intent where persistence is available; if persistence is unavailable, still initiate cancellation and retain the limitation.
+4. Request cancellation immediately, without waiting for the normal runtime deadline; use the bounded graceful-stop and force-stop/inspection phases within the total shutdown budget.
+5. Await supervised tasks without assuming that dropping a future stops an external process or container.
+6. Record terminal or unknown outcomes where possible.
+7. Flush persistence and diagnostic sinks within deadlines.
+8. Exit, reporting any incomplete cleanup where the process can still do so.
 
-The `Planner` implements the typed autonomy loop. It:
+Graceful shutdown is distinct from crash recovery. In-process monotonic deadlines do not survive process death; startup recovery inspects and stops surviving workers. Do not promise zero lost diagnostics or that a panic hook always allocates, logs, flushes, or recovers. Panic hooks are best-effort diagnostics only and may not run during abort or forced process termination. Startup checks can validate required configuration/dependencies at startup but do not prove infrastructure remains healthy.
 
-- Reads `TargetDiscovered` and `FindingConfirmed` events
-- Generates typed `ProbeSpec<P, V>` instances
-- Validates probes against `ScopeContract`
-- Emits `ProbeDispatched` events
+If Tokio `TaskTracker` is selected, `close()` is not admission control: future spawn calls still need to be prevented separately. `wait()` is asynchronous and must be awaited by the shutdown coordinator; an unawaited wait in `Drop` is not a shutdown guarantee. Task admission gating and completion tracking are separate responsibilities.
 
-**Decision logic (high level):**
-- Uses coverage-guided strategy to prioritize untested regions.
-- Uses fingerprint deduplication to prevent redundant probes.
-- Leverages type-level versioning to ensure fingerprint schema compatibility.
+## Failure behavior and limitations
 
-**Example (shape only):**
-```rust
-let probe = ProbeSpec::<PortScanProbe, 1>::new(target, preconditions);
-let validated_probe = probe.validate(&scope)?; // Typestate transition
-planner.dispatch(validated_probe);             // Only validated probes can be dispatched
-```
+- Denied, malformed, expired, revoked, unsupported, or over-budget work does not reach the worker.
+- Persistence failure before intent blocks dispatch. Failure after intent may leave an unknown outcome.
+- Worker reports are untrusted and can be missing, malformed, duplicated, late, or contradictory; control-plane ingestion validates them and does not infer a known result from a timeout. Late reports append facts and do not silently overwrite accepted history.
+- Cancellation requests are best effort until the broker confirms stop/termination; cancellation cannot reverse target-side effects.
+- Raw artifacts and target content remain untrusted through validation and must be rendered inert in the UI.
+- There are no automatic target-facing retries, redirects, escalations, or multi-agent chains in v0.1.
 
-### Executor
+The [M1 protocol](m1-protocol.md) selects the deployment, authentication, PostgreSQL, broker/claim, worker-ownership, network, and artifact design. Those mechanisms are not implemented or verified. Remaining design closure concerns the supported host/kernel/Docker/firewall envelope, concrete database role/constraint implementation, credential provisioning procedure, and deployment-specific resource/storage ceilings. Docker does not automatically provide the proposed destination policy and is not claimed to be escape-proof.
 
-The `Executor` owns sandbox lifecycle. It:
+## Verification requirements
 
-- Receives `ProbeDispatched` events
-- Spawns sandboxes (Docker containers, gVisor, Firecracker)
-- Streams tool output with size caps
-- Emits `ProbeCompleted` or `ProbeFailed` events
+These are proposed tests, not claimed passing results. Before target-facing execution, verify:
 
-**Sandbox execution:**
-```rust
-impl Executor {
-    async fn execute_probe<P: VulnerabilityClass, const V: u32>(
-        &self,
-        probe: ProbeSpec<P, V, Validated>,
-    ) -> Result<Vec<EvidenceArtifact>, ProbeError> {
-        let sandbox = self.sandbox_pool.acquire().await?;
-        
-        // Streaming API with early abort on size threshold
-        let output_stream = sandbox.run_tool_streaming(
-            probe.tool_family, 
-            probe.parameters
-        ).await?;
-        
-        let artifacts = self.ingest_stream_with_cap(
-            output_stream, 
-            MAX_ARTIFACT_SIZE
-        ).await?;
-        
-        Ok(artifacts)
-    }
-}
-```
-
-**Design: Streaming-First Cap Enforcement**
-
-Size caps are enforced during streaming ingestion, not after full buffering. The sandbox API returns a `Stream` of chunks, and `ingest_stream_with_cap` aborts early once size thresholds are exceeded. This prevents unbounded memory spikes from large or malicious tool outputs.
-
-**Retry policy (high level):** Transient errors (e.g., timeouts, resource exhaustion) may be retried with exponential backoff. Permanent errors (e.g., policy violations) fail immediately without retry.
-
-**See [architecture.md](./architecture.md) for error retryability encoding via `fn is_retryable(&self) -> bool`.**
-
-### Validator
-
-The `Validator` confirms findings and filters false positives. It:
-
-- Reads `ProbeCompleted` events
-- Parses tool output and extracts vulnerabilities
-- Confirms findings via re-execution or heuristics
-- Emits `FindingConfirmed` or `FalsePositive` events
+| Requirement | Acceptance evidence |
+|---|---|
+| Persistence before execution | Simulate unavailable event persistence; verify no worker is launched. |
+| Crash after dispatch intent | On startup inspect owned workers before re-enabling dispatch; unresolved cleanup blocks execution. Reconstruct unknown outcome with no automatic redispatch. |
+| Replay isolation | Replay completed and unresolved runs; assert zero executor calls. |
+| Duplicate handling | Repeat request/attempt delivery and verify explicit idempotency behavior without silent extra execution. |
+| Egress/capability restriction | Inspect default-deny configuration; test worker loopback, host services, unrelated private/public destinations, metadata services, unrelated workers, and approved fixture networking separately for the selected topology. Representative tests do not prove every destination unreachable. |
+| Expiry/revocation | Change policy before broker final check and during execution; verify pre-launch denial or bounded cancellation, respectively, and that the execution deadline is bounded by policy expiry/runtime budget. |
+| Cancellation/deadline | Verify running worker receives cancellation and is stopped/terminated within the bounded grace period; preserve unknown outcome if needed. |
+| Evidence accounting | Concurrent captures stay under per-artifact and aggregate run caps; incomplete observations remain distinct from execution outcomes and cannot alone confirm a finding. |
+| Shutdown | Admission closes, workers are handled, supervised tasks awaited, and persistence/diagnostic flushes observe deadlines. |
+| Safe rendering | Raw HTML and terminal/control sequences are inert in inspection surfaces. |
 
-**Confirmation strategy:**
-- High-confidence findings (e.g., HTTP 200 on SQL injection) auto-confirm
-- Low-confidence findings (e.g., banner version string) require re-execution
+The [testing strategy](./testing.md) and [M1 protocol](m1-protocol.md) specify proposed requirements, not passing tests. No snapshots are required in v0.1. If later justified by measured replay cost, snapshots reduce replay work but do not replace history or make recovery cost independent of state size.
 
-### ChainPlanner
-
-The `ChainPlanner` synthesizes attack chains. It:
+## Deferred work and references
 
-- Reads `FindingConfirmed` events
-- Identifies escalation opportunities (e.g., "SSH open → try weak credentials")
-- Proposes typed escalations via `EscalationProposed` events
-
-**Example:**
-```rust
-// Finding: SSH on port 22
-let escalation = EscalationProposal {
-    from: ssh_finding_event_id,
-    to: ProbeSpec::<SshBruteForceProbe, 1>::new(target, credentials),
-    rationale: "SSH service detected; attempting weak credentials".to_string(),
-};
-chain_planner.propose(escalation);
-```
-
-### Mentor
-
-The `Mentor` reviews escalations and approves/disputes them. It:
-
-- Reads `EscalationProposed` events
-- Applies policy and risk heuristics
-- Emits `EscalationTransitioned` events with state `Approved` or `Disputed`
+Defer distributed actor requirements, general target resolution, domain/CIDR authorization, arbitrary tools, retries of target-facing actions, coverage maps, attack-chain planning, escalation review, snapshots, recursive schema migration, and alternate sandbox backends. Future features require their own security/reliability acceptance criteria.
 
-**Approval rules (example):**
-- Low-risk escalations (e.g., "port scan → service fingerprint") may be auto-approved.
-- High-risk escalations (e.g., "RCE → lateral movement") typically require operator review.
-
-**Typestate transition:**
-```rust
-pub enum EscalationState {
-    Proposed,      // Awaiting Mentor review
-    Approved,      // Mentor approved, executor can dispatch
-    Disputed,      // Mentor rejected with rationale
-    Superseded,    // Newer escalation invalidates this one
-}
-```
-
-### Supervisor
-
-The `Supervisor` monitors all actors and handles panics. It:
-
-- Registers actors in the `ActorRegistry`
-- Subscribes to actor health signals
-- Captures panics via `std::panic::set_hook`
-- Logs panics to the panic-log sink
-- Escalates critical failures to the operator
-
-**Panic handling (shape):**
-```rust
-std::panic::set_hook(Box::new(move |info| {
-    let panic_log = format!("{:?}", info);
-    panic_sink.log(panic_log); // Must succeed even if other actors are dead.
-}));
-```
-
-**Panic Hook Lifetime:**
-
-The panic hook is installed exactly once during startup via a guarded initializer:
-
-```rust
-use std::sync::Once;
-
-static PANIC_HOOK_INIT: Once = Once::new();
-
-pub fn install_panic_hook(panic_sink: Arc<PanicLogSink>) {
-    PANIC_HOOK_INIT.call_once(|| {
-        let prev_hook = std::panic::take_hook();  // Store previous hook if chaining is needed
-        std::panic::set_hook(Box::new(move |info| {
-            panic_sink.log(format!("{:?}", info));
-            // Optionally: prev_hook(info); for chaining
-        }));
-    });
-}
-```
-
-**Invariant:** `install_panic_hook` is called exactly once from `main()` before any actors spawn. Multiple calls are no-ops due to the `Once` guard. This prevents accidental replacement or late installation that could lose diagnostics.
-
-**Invariant:** The panic-log sink outlives all actors (see Shutdown Ordering below).
-
-## Backpressure Strategy
-
-Unbounded queues lead to memory exhaustion. NEORAPTOR uses bounded queues with explicit shedding rules.
-
-### Bounded Queues
-
-Every actor mailbox has a capacity limit, configured per actor type.
-
-**Exceeding capacity:** New messages trigger backpressure rather than unbounded queue growth (see shedding rules below).
-
-**Mailbox API: Typed Send Wrappers**
-
-Mailboxes are wrapped in typed send APIs that enforce `CanShed` / `NeverShed` semantics:
-
-```rust
-pub struct ShedableMailbox<M: CanShed> {
-    inner: mpsc::Sender<M>,
-}
-
-impl<M: CanShed> ShedableMailbox<M> {
-    pub fn try_send(&self, msg: M) -> Result<(), TrySendError<M>> {
-        self.inner.try_send(msg)  // Non-blocking; sheds if full
-    }
-}
-
-pub struct GuaranteedMailbox<M: NeverShed> {
-    inner: mpsc::Sender<M>,
-}
-
-impl<M: NeverShed> GuaranteedMailbox<M> {
-    pub async fn send(&self, msg: M) -> Result<(), SendError<M>> {
-        self.inner.send(msg).await  // Blocks until capacity available
-    }
-}
-```
-
-This prevents `try_send` from being accidentally used with governance events and ensures backpressure semantics are explicit at the type level.
-
-### Shedding Rules
-
-When backpressure is triggered, the system:
-
-1. Preferentially sheds lowest-priority work (e.g., informational probes before critical ones).
-2. Enforces a hard cap on the human-review queue for disputed findings and escalations.
-3. Throttles or rejects new runs when capacity thresholds are exceeded (e.g., HTTP 429).
-
-**Message Queue API Design: Typestate Shedding Policy**
-
-To prevent governance events like `EscalationTransitioned` from being silently dropped, the message queue API restricts shed-enabled mailboxes:
-
-- **Shed-enabled mailboxes** accept only messages implementing `CanShed` marker trait
-- **Governance events** implement `NeverShed` marker trait
-- Invalid enqueues (e.g., `NeverShed` message to shed-enabled queue) fail at compile time
-
-This ensures priority shedding cannot break replay or state consistency by accidentally dropping critical governance transitions.
-
-**Audit Trail: ProbeShed Events**
-
-When a message is dropped due to backpressure, a `ProbeShed` run event is emitted to the event log. This enables:
-
-- Operators to distinguish "not probed" from "probed and found nothing"
-- Replay to reconstruct when shedding occurred
-- Incident review to explain missing work and correlate gaps in probing
-
-**Metrics:** Queue depth and drop rate are exposed via Prometheus and used to tune capacities in configuration and ADRs.
-
-## Supervision and Shutdown
-
-### ActorRegistry
-
-The `ActorRegistry` tracks all active actors and their health:
-
-```rust
-pub struct ActorRegistry {
-    // Tracks all running actors and provides coordinated shutdown.
-    // Exact storage and handle types are implementation details.
-}
-```
-
-**Task Ownership and Cancellation:**
-
-All actor tasks are spawned through a centralized `ActorSupervisor` that owns cancellation tokens:
-
-```rust
-pub struct ActorSupervisor {
-    cancellation_token: CancellationToken,
-    task_tracker: TaskTracker,
-}
-
-impl ActorSupervisor {
-    pub fn spawn<F>(&self, future: F) -> JoinHandle<F::Output>
-    where
-        F: Future + Send + 'static,
-        F::Output: Send + 'static,
-    {
-        let token = self.cancellation_token.child_token();
-        self.task_tracker.spawn(async move {
-            tokio::select! {
-                result = future => result,
-                _ = token.cancelled() => {
-                    // Graceful cancellation
-                }
-            }
-        })
-    }
-    
-    pub async fn shutdown(&self) {
-        self.cancellation_token.cancel();  // Signal all tasks
-        self.task_tracker.close();
-        self.task_tracker.wait().await;    // Join explicitly
-    }
-}
-```
-
-**Invariant:** All spawns route through `ActorSupervisor::spawn`. Direct `tokio::spawn` calls are prohibited to prevent detached tasks from outliving shutdown signals or holding resources longer than intended.
-
-**Enforcement:** Add a clippy lint or code review checklist item to forbid raw `tokio::spawn` outside of `ActorSupervisor`. CI should reject PRs that bypass the supervisor.
-
-### Shutdown Ordering
-
-**Invariant:** Panic-log sink must outlive all actors to ensure no panics are lost.
-
-**Design: Typestate-Encoded Shutdown Phases**
-
-To enforce the `DrainActors -> FlushLogs` sequencing at compile time, shutdown ordering is encoded as a typestate progression:
-
-```
-Shutdown<Active> -> Shutdown<DrainActors> -> Shutdown<FlushLogs> -> Done
-```
-
-This makes the drop order type-checked rather than relying solely on runtime `TaskTracker` sequencing. A refactor that reorders shutdown phases will fail at compile time instead of silently losing late panics.
-
-**Current Implementation (TaskTracker-based):**
-
-```rust
-// In api/src/main.rs
-use tokio_util::task::TaskTracker;
-
-struct InfraHandles {
-    panic_sink: Arc<PanicLogSink>,
-    task_tracker: TaskTracker,  // Tracks all actor tasks
-}
-
-impl Drop for InfraHandles {
-    fn drop(&mut self) {
-        // Block until all tasks complete
-        self.task_tracker.close();
-        self.task_tracker.wait();  // Ensures panic sink is released last
-    }
-}
-
-// Startup
-let panic_sink = Arc::new(PanicLogSink::new());
-let task_tracker = TaskTracker::new();
-
-// Spawn actors via the tracker (not tokio::spawn directly)
-task_tracker.spawn(orchestrator_actor.run());
-task_tracker.spawn(executor_actor.run());
-
-// On shutdown signal
-drop(InfraHandles { panic_sink, task_tracker });
-// All actors have joined before panic_sink is dropped
-```
-
-**Shutdown sequence (high level):**
-1. Stop accepting new HTTP requests.
-2. `InfraHandles` Drop impl is invoked
-3. `task_tracker.close()` prevents new spawns
-4. `task_tracker.wait()` blocks until all actors join
-5. Panic-log sink is dropped (Arc refcount → 0)
-6. Terminate the process.
-
-**Why TaskTracker?** Without explicit ordering (e.g., using bare `tokio::spawn`), Tokio drops tasks in non-deterministic order. The TaskTracker ensures all spawned tasks complete before `InfraHandles` is fully dropped, guaranteeing that the `panic_sink` Arc outlives any panic hook that might fire.
-
-**Test:** A dedicated shutdown-ordering test (`InfraHandles` shutdown ordering; see [testing.md](./testing.md)) validates this invariant.
-
-### Panic Severity Policy
-
-Panic escalation is modeled with a small severity enum:
-
-```rust
-pub enum PanicSeverity {
-    Recoverable,   // Log and continue.
-    Critical,      // Log, alert operator, continue.
-    Fatal,         // Log, alert operator, initiate shutdown.
-}
-```
-
-**Transition rules (example):**
-- Single panic in a non-critical actor is treated as `Recoverable`.
-- Panics in critical components (e.g., `Orchestrator`, `EventStore`) are treated as `Critical`.
-- Repeated panics in a short window may be escalated to `Fatal` to trigger shutdown.
-
-Exact thresholds and mappings are documented in ADRs and configuration, not hard-coded here.
-
-## Startup vs Runtime Boundary
-
-Startup invariants (e.g., "event store is reachable", "ScopeContract has allowed_targets") are enforced via a typestate builder. Runtime code runs with all invariants pre-validated.
-
-### Startup Typestate Builder
-
-**Problem:** Partially-initialized infrastructure can lead to panics or silent failures at runtime.
-
-**Solution:** Encapsulate startup in a typestate builder that enforces required fields (event store, panic sink, actor registry, configuration) before the system reaches the runtime phase.
-
-At a high level:
-
-```rust
-pub struct InfraHandlesBuilder<State> { /* fields omitted */ }
-pub struct StartupPhase;
-pub struct RuntimePhase;
-
-impl InfraHandlesBuilder<StartupPhase> {
-    pub fn new() -> Self { /* ... */ }
-    pub fn with_event_store(self, store: Arc<EventStore>) -> Self { /* ... */ }
-    pub fn with_panic_sink(self, sink: Arc<PanicLogSink>) -> Self { /* ... */ }
-    pub fn with_actor_registry(self, registry: Arc<ActorRegistry>) -> Self { /* ... */ }
-    pub fn build(self) -> Result<InfraHandles<RuntimePhase>, BuildError> { /* ... */ }
-}
-```
-
-**Benefit:** Missing required fields are detected when `build()` is called, not at arbitrary runtime points. Runtime code operates only in the `RuntimePhase`.
-
-### ScopeContract Sharing Across Async Boundaries
-
-**Design: Arc::clone as the Only Sharing Path**
-
-When sharing `ScopeContract` across `async` boundaries, use `Arc::clone(&scope)` as the only supported mechanism. This prevents long-lived tasks from synthesizing alternate scope constructions.
-
-**Invariant:** `ScopeContractBuilder::build()` is restricted to startup wiring. No alternate scope can be constructed after the system enters the runtime phase.
-
-This design makes it safe to share scopes while preventing relaxed governance from being introduced in background tasks.
-
-**ADR:** See [adr/ADR-006-startup-typestate.md](./adr/ADR-006-startup-typestate.md) for full rationale.
-
-## Heap Health Monitoring
-
-Long-running actor systems can leak memory. NEORAPTOR monitors heap health and exposes dev tooling for leak detection.
-
-### Monitoring Strategy
-
-**Metrics (examples):**
-- `heap_size_bytes`: Total heap size.
-- `heap_growth_rate_bytes_per_sec`: Rate of heap growth.
-- `actor_mailbox_depth`: Per-actor queue depth.
-
-Alert thresholds and dev tooling (e.g., heap snapshots, `tokio-console`) are defined in [observability.md](./observability.md) and associated ADRs, not hard-coded here.
-
-## Further Reading
-
-- [architecture.md](./architecture.md) — High-level system overview
-- [domain-model.md](./domain-model.md) — Event schemas and domain types
-- [security.md](./security.md) — Trust boundaries and governance
-- [observability.md](./observability.md) — Metrics, traces, and monitoring
-- [testing.md](./testing.md) — Shutdown ordering tests and macro stability tests
-- [adr/ADR-006-startup-typestate.md](./adr/ADR-006-startup-typestate.md) — Startup typestate builder decision
+See [architecture.md](./architecture.md), [domain-model.md](./domain-model.md), [security.md](./security.md), the [proposed testing strategy](./testing.md), [observability](./observability.md), and the canonical [M1 protocol](./m1-protocol.md) for the coordinated design.

@@ -1,106 +1,89 @@
-# NEORAPTOR: The Autonomous Offensive-Security OS
+# NEORAPTOR
 
-**NEO** references *The Matrix* — "the One" who sees the truth behind the illusion, like a pentester revealing the real state behind dashboards and firewalls.  
-**RAPTOR** evokes a fast, precise predator, matching Rust's performance profile and the goal: hunt vulnerabilities quickly, safely, and intelligently.
+NEORAPTOR is currently a Rust scaffold for a proposed governed security
+assessment platform. It is not a working assessment platform: the current
+binary prints `Hello, world!`, and no API, worker, SvelteKit client, database
+migration, or assessment capability is implemented.
 
-NEORAPTOR is a foundation for continuous, AI-driven adversarial emulation. It orchestrates typed tool families over a replayable evidence graph, designed to behave like a senior, governed offensive operator with full operator-visible reasoning.
+The long-term product direction and unvalidated customer hypotheses are
+recorded in [docs/product.md](docs/product.md). Current permissions and
+dependency gates are in [docs/plan/INDEX.md](docs/plan/INDEX.md), with
+verified repository state and open design work in
+[docs/plan/STATUS.md](docs/plan/STATUS.md).
 
-Unlike opaque AI agents or static scanners, NEORAPTOR is engineered in Rust with deterministic event-sourced runs and cryptographically verifiable scope contracts for forensic auditability and execution safety.
+## Run the scaffold
 
----
+The repository pins Rust **1.95.0** in `rust-toolchain.toml`.
 
-## Quick Start
-
-### Prerequisites
-
-- **Rust:** `1.82+` (see `rust-toolchain.toml`)
-- **Docker:** For sandboxed tool execution
-- **PostgreSQL:** Event log and artifact storage
-
-### Build & Run
-
-```bash
-# Install dependencies
-just install-deps
-
-# Build the workspace
-cargo build --workspace
-
-# Run tests
-cargo test --workspace
-
-# Start the control plane (development)
-cargo run --bin neoraptor-api
-
-# Start a sandboxed worker
-cargo run --bin neoraptor-worker
+```sh
+cargo run
 ```
 
-See `justfile` for additional commands.
+This runs the existing scaffold and prints `Hello, world!`. Docker and
+PostgreSQL are proposed M1 runtime dependencies; they are not required to run
+the current binary.
 
----
+The existing `just dev` recipe invokes `cargo run` and therefore has the same
+scaffold behavior. The `justfile` also declares formatting, lint, dependency
+check, build, and test recipes; their existence is not evidence that checks
+have passed. `prepare-sqlx` is a recipe only and does not mean SQLx or a
+database-backed application is implemented.
 
-## Architecture
+## Proposed M1 design
 
-NEORAPTOR is an autonomous offensive-security control plane built on event-sourced runs and typed tool orchestration.
+The next intended implementation foundation is limited to one authenticated
+operator, one dedicated local HTTP fixture, one fixed read-only HTTP
+observation, one active target-facing attempt, bounded evidence, and explicit
+recovery. These are design decisions, not present permissions or implemented
+controls.
 
-**Start here:** [docs/architecture.md](docs/architecture.md) — High-level system overview (~5 min read)
+- [M1 deployment and execution protocol](docs/m1-protocol.md) — proposed
+  canonical topology, authentication, PostgreSQL, admission, broker,
+  network, artifact, recovery, and frontend behavior.
+- [Architecture](docs/architecture.md) — proposed system boundaries.
+- [Domain model](docs/domain-model.md) — proposed requests, events, attempts,
+  observations, and evidence.
+- [Security](docs/security.md) — proposed authorization and execution
+  restrictions.
+- [Runtime](docs/runtime.md) — proposed dispatch, cancellation, and recovery.
+- [Frontend contract](docs/frontend.md) and
+  [frontend design](docs/frontend-design.md) — proposed static SvelteKit
+  operator client; no frontend implementation exists.
+- [Testing strategy](docs/testing.md) — proposed tests, not an existing suite.
+- [Observability](docs/observability.md) — proposed operator visibility and
+  bounded diagnostics.
+- [Architecture decisions](docs/adr/README.md) — reviewed decisions and
+  deferred historical proposals.
+- [Proposed M1 schema](crates/db/schema.dbml) — descriptive DBML, not a
+  migration or implemented database.
 
-**Detailed docs:**
-- [docs/domain-model.md](docs/domain-model.md) — RunEvent, ScopeContract, ProbeSpec, Evidence
-- [docs/runtime.md](docs/runtime.md) — Actors, backpressure, supervision, shutdown
-- [docs/security.md](docs/security.md) — ScopeContract enforcement, sandboxes, governance
-- [docs/observability.md](docs/observability.md) — Metrics, traces, coverage, heap health
-- [docs/testing.md](docs/testing.md) — Testing strategy, macro stability, CI
-- [docs/adr/](docs/adr/) — Architecture decision records
-
----
-
-## Project Structure
+## Repository contents
 
 ```text
-neoraptor-workspace/
+.
+├── Cargo.toml
+├── Cargo.lock
 ├── crates/
-│   ├── agents-core/          # Core primitives: RunEvent, ScopeContract, Evidence
-│   ├── agents-impl/          # Typed Autonomy Loop actors
-│   ├── neoraptor-api/        # HTTP API and composition root
-│   ├── neoraptor-tools/      # Typed tool wrappers
-│   ├── neoraptor-sandbox/    # Docker/gVisor isolation runtime
-│   ├── config/               # Configuration types
-│   ├── ports/                # Abstract capability traits
-│   ├── providers/            # Concrete implementations
-│   └── memory/               # Event log and evidence graph
-├── docs/                     # Architecture and design docs
-└── justfile                  # Build automation
+│   └── db/
+│       └── schema.dbml
+├── docs/
+│   ├── adr/
+│   ├── plan/
+│   └── ...
+├── justfile
+├── rust-toolchain.toml
+└── src/
+    └── main.rs
 ```
 
----
+There are no implemented API, worker, or frontend crates and no executable
+assessment workflow.
 
-## Development Workflow
+## Checks and workflow facts
 
-1. **Create a branch** for your feature or fix
-2. **Run tests** with `cargo test --workspace`
-3. **Check lints** with `cargo clippy --workspace -- -D warnings`
-4. **Format code** with `cargo fmt --all`
-5. **Update `.sqlx/`** if adding DB queries: `just prepare-sqlx`
-6. **Submit a PR** targeting `main`
-
----
-
-## Documentation
-
-- **[Architecture](docs/architecture.md)** — Full system design and implementation details
-- **[Security](SECURITY.md)** — Security model, threat boundaries, and disclosure policy
-- **[Work Plan](/docs/plan/INDEX.md)** — Roadmap and milestones for development
----
-
-## Contributing
-
-Contributions are welcome! Please:
-
-- Follow the Rust API guidelines
-- Respect the architectural boundaries (see [docs/architecture.md](docs/architecture.md))
-- Add tests for new functionality
-- Update documentation as needed
-
-For questions or discussions, open an issue.
+The checked-in [CI workflow](.github/workflows/ci.yml) declares formatting,
+Clippy, `cargo deny` advisory/ban/source checks, build, and test jobs for
+pushes and pull requests targeting `master`. It does not run the `licenses`
+check. This describes the workflow file only; it does not assert successful
+runs, branch protection, or that `master` is the repository's default branch.
+No pull-request base branch is prescribed here.

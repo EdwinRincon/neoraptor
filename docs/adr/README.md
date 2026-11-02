@@ -4,33 +4,37 @@ This directory contains Architecture Decision Records for NEORAPTOR — document
 
 ## Index
 
-- [ADR-001: Event Sourcing as Foundation](./ADR-001-event-sourcing.md)
-  - Decision: Use event sourcing as the foundational data model
-  - Why: Audit trails, time-travel debugging, schema evolution, replayability
+- [ADR-001: Event Sourcing for Authoritative Run Facts](./ADR-001-event-sourcing.md)
+  - Decision: Accepted events are authoritative run history; projections are rebuildable. PostgreSQL is selected for M1 metadata, events, coordination, and bounded artifact chunks.
+  - Why: Preserve recorded lifecycle facts while keeping live coordination and derived views distinct.
 
-- [ADR-002: Typed Probes with Const Generics](./ADR-002-typed-probes.md)
-  - Decision: Encode vulnerability class and schema version in `ProbeSpec` type via phantom type and const generic
-  - Why: Compile-time safety for cross-version fingerprint deduplication
+- [ADR-002: Structured Action Requests and Explicit Schema Versioning](./ADR-002-typed-probes.md)
+  - Decision: Use structured requests, explicit runtime schemas, immutable execution-relevant content, and persisted schema versions.
+  - Why: Validate supported requests without overstating compile-time or fingerprint guarantees.
 
-- [ADR-003: Fail-Closed ScopeContract Governance](./ADR-003-fail-closed-governance.md)
-  - Decision: Enforce `ScopeContract` at planning time with fail-closed semantics
-  - Why: Prevent accidental over-scoping, catch policy violations early
+- [ADR-003: Fail-Closed Authorization and Execution Enforcement](./ADR-003-fail-closed-governance.md)
+  - Decision: Separate structural validation, policy evaluation, final execution permission, and execution-boundary restrictions.
+  - Why: Reject unsupported or stale requests before target-facing work.
 
-- [ADR-004: Bounded Queues and Backpressure](./ADR-004-bounded-queues.md)
-  - Decision: Use bounded queues for actor mailboxes with explicit shedding rules
-  - Why: Bounded memory usage, predictable latency, graceful degradation
+- [ADR-004: Bounded Queues and Explicit Overload Handling](./ADR-004-bounded-queues.md)
+  - Decision: Bound internal queues and payloads; explicitly handle busy admission, channel failures, cancellation, and optional shedding.
+  - Why: Avoid unbounded resource use without silently losing required facts.
 
-- [ADR-005: Output Size Caps](./ADR-005-output-size-caps.md)
-  - Decision: Enforce strict size caps on sandbox output (10 MB per artifact, 100 MB per run)
-  - Why: Prevent resource exhaustion from unbounded tool output
+- [ADR-005: Bounded Artifact Capture and Output Limits](./ADR-005-output-size-caps.md)
+  - Decision: Configure 10 MiB per artifact and 100 MiB per run, with bounded streaming ingestion and explicit completeness.
+  - Why: Limit retained evidence while preserving execution outcome separately.
 
-- [ADR-006: Startup Typestate Builder](./ADR-006-startup-typestate.md)
-  - Decision: Encapsulate startup in a typestate builder that enforces required fields
-  - Why: Build-time errors for missing components, shutdown ordering guarantees
+- [ADR-006: Startup Validation and Explicit Bounded Shutdown](./ADR-006-startup-typestate.md)
+  - Decision: Validate required dependencies/readiness and use explicit bounded asynchronous shutdown.
+  - Why: Surface startup failure and cleanup limits without claiming compile-time or `Drop` enforcement.
 
 - [ADR-007: Macro Stability Testing](./ADR-007-macro-stability.md)
-  - Decision: Use snapshot tests to version-control macro-generated code
-  - Why: Detect regressions in async bounds, typestate constraints, compiler compatibility
+  - Decision: Deferred — outside M1; no custom procedural-macro implementation is established.
+  - Why: Reconsider only when an approved capability demonstrates a need for custom procedural macros.
+
+- [ADR-008: M1 Fixture Keys, Request Equality, and Outcome Mapping](./ADR-008-m1-fixture-keys-request-equality-and-outcome-mapping.md)
+  - Decision: Require the accepted fixture-key syntax, exact normalized-request equality without request digests, and authoritative outcome facts.
+  - Why: Keep request identity and execution outcomes explicit without making projections authoritative.
 
 ## ADR Format
 
@@ -78,5 +82,5 @@ When making a significant architectural decision:
 When an ADR is superseded, update its status and link to the replacement:
 
 ```markdown
-**Status:** Superseded by [ADR-XXX](./ADR-XXX.md)
+**Status:** Superseded by ADR-XXX (link to the replacement ADR).
 ```
