@@ -328,6 +328,7 @@ request:
 | Same key, same normalized request | Return the original stored result/reference. |
 | Same key, different normalized request | Return conflict; do not modify the original record. |
 | New key while slot is occupied or recovery-disabled | Persist and return `busy`; create no attempt or queued work. |
+| New request with no remaining run capture budget | Return explicit admission failure `capture_budget_exhausted`; create no attempt, reserve no execution slot, dispatch no worker, and create no artifact or observation. This is not a capture reason or execution outcome. Durable idempotency/retry handling for this rejection remains part of admission/idempotency design closure. |
 | New key with slot available | Atomically accept request, attempt, intent, idempotency result, and slot reservation before live dispatch. |
 
 Retain idempotency keys, complete normalized request values, and results for
@@ -476,14 +477,21 @@ with zero retained bytes and the digest of the empty byte sequence. It is not
 
 For each artifact:
 
-1. Reserve per-artifact and per-run capture budget transactionally before
-   capture. Staging bytes remain covered by that reservation; accounting
+1. Under the serialized per-run accounting transaction, compute remaining run
+   budget as `capture_limit - retained_bytes - reserved_bytes`. If it is zero,
+   reject the request before creating an attempt as specified above. Otherwise
+   reserve `min(per_artifact_capture_cap, remaining_run_budget)` before
+   capture. This reservation is the artifact's effective capture limit and
+   must be stored as its `max_retained_bytes`; do not reserve or retain above
+   it. Staging bytes remain covered by the full reservation, and accounting
    remains correct under concurrent ingestion.
 2. Create staging metadata; staging is not completed evidence.
 3. Read through bounded transport/process buffers and write bounded chunks
    incrementally with ordered chunk numbers.
 4. Track exact retained bytes and a digest over exactly the retained bytes.
-   Never retain bytes beyond either capture limit.
+   Never retain bytes beyond the effective artifact limit or run limit. A
+   normally completed stream ending exactly at its effective limit may be
+   complete; only observed additional data establishes excess.
 5. In one transaction, finalize metadata, append an `artifact_finalized` event
    and its artifact/event link, append an `observation_recorded` event, and
    write the attempt observation referencing that event. Commit all of these
@@ -508,6 +516,46 @@ For each artifact:
    retained bytes.
 8. Bound cleanup after failure or termination. Do not require unbounded
    lookahead, memory buffering, or stream draining to detect cap exceedance.
+
+### Recovery and cleanup accounting
+
+A staging artifact is abandoned only after its capture owner is confirmed
+stopped or absent and no writer can resume it. Age alone does not establish
+abandonment. Until ownership is resolved, do not clean the staging data,
+release its reservation, or release the execution slot.
+
+On recovery, verify staged chunk ordering and lengths, retained-byte count,
+reservation, and digest. Compare the run accounting row with the artifact
+records: `reserved_bytes` must equal the reservations held by staging
+artifacts, and `retained_bytes` must equal the retained bytes of finalized
+artifacts. Also verify chunk totals and digests, nonnegative counters, and
+`reserved_bytes + retained_bytes <= capture_limit`. If every artifact and
+reservation is independently verifiable, reconcile the counters to those
+verified totals in a serialized transaction and append a
+`reconciliation_recorded` event with the actor and evidence references.
+Preserve accepted events and finalized artifacts; never silently rewrite or
+delete either. Record the prior and reconciled counters and affected
+artifact/attempt references without including artifact bytes.
+
+Event replay and projection rebuild are not accounting reconciliation. They
+cannot create artifacts, change reservations or retained-byte counters,
+authorize execution, or launch workers.
+
+If accounting disagrees and the evidence cannot establish safe totals, do not
+expose or finalize unverifiable staging data, create new capture reservations,
+release the execution slot, or re-enable dispatch. Surface the inconsistency
+for operator reconciliation. Keep capture and dispatch disabled until a
+consistent state is established; unresolved or orphaned chunks without a
+trustworthy artifact/accounting association are not automatically deleted.
+
+Remove abandoned staging chunks only in bounded cleanup transactions. Each
+successful cleanup transaction must atomically record a
+`reconciliation_recorded` event with actor and evidence references, affected
+run/attempt/artifact identifiers, the reason, verified chunk count and byte
+count removed, reservation released, and cleanup result. Do not include
+artifact bytes in the audit event. A cleanup interruption must leave its
+accounting and audit transaction either wholly committed or wholly rolled
+back.
 
 Never put artifact bytes in event JSON. The digest covers retained
 application-level response bytes and is not proof of provenance if both
@@ -650,6 +698,7 @@ cannot be established.
 | Crash before container creation | Intent/claim/launch authorization may exist | No worker if absence is established | Inspect broker ownership and Docker inventory; record known launch failure or unknown if uncertain | Only after ownership and cleanup reconciliation |
 | Crash after creation or after start before acknowledgement | Durable worker identity; container ID may or may not be recorded | Worker may contact fixture after start | Reconcile by trusted identifiers, stop surviving worker, preserve unknown outcome as needed | No until stop/cleanup is established |
 | Persistence failure during capture | Prior accepted facts only; failure may be unpersistable | Active worker may already have contacted fixture | Stop new dispatch; cancel/terminate active work; bounded stream cleanup; preserve known facts and uncertainty | No until persistence and recovery are healthy |
+| Run capture accounting disagrees with artifacts | Counters, staging, or finalized artifact records disagree | No new target effect is authorized by reconciliation | Stop new reservations; do not expose unverifiable staging; reconcile verified totals with an attributed event or surface the unresolved discrepancy | No until accounting is consistent; do not release the slot while unresolved |
 | Capture cap exceeded | Retained bytes up to cap and prior execution facts | Request may have completed or been interrupted | Retain no excess; mark incomplete; terminate and clean stream boundedly | After worker stop and cleanup |
 | Policy expiry/revocation | Approval/revocation and launch-authorization ordering facts as committed | Effects before cancellation may already exist | Before launch deny; after launch authorization initiate cancellation and bounded stop | Only after current policy and slot are valid |
 | Artifact finalization interrupted | Staging metadata/chunks; no observation/artifact finalization link unless final transaction committed | Execution may be complete or unknown independently | Verify chunks, exact count, reservation, and digest; atomically finalize verified retained bytes as incomplete(reason), or record unavailable(reason) without an artifact; clean orphans boundedly | After artifact and attempt reconciliation |

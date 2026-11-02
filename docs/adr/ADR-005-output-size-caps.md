@@ -21,8 +21,10 @@ The ingestion contract is:
 
 1. Read bounded chunks into bounded intermediate buffers. Never buffer the
    complete artifact in memory or accept unbounded chunks from a source.
-2. Reserve aggregate per-run capacity before capture. Account for retained
-   bytes exactly across concurrent ingestion and recovery.
+2. Reserve aggregate per-run capacity transactionally before capture. The
+   effective artifact limit cannot exceed the remaining run budget; the
+   canonical [M1 protocol](../m1-protocol.md) specifies reservation sizing,
+   release, and recovery accounting.
 3. Write incrementally to controlled staging storage. Retain no bytes beyond
    the configured artifact or run limit.
 4. Track exact retained-byte count and compute the content digest over the
@@ -30,8 +32,9 @@ The ingestion contract is:
 5. Record explicit observation-completeness metadata, including whether the
    capture completed normally or became incomplete and why.
 6. Finalize artifacts through a controlled storage operation and establish
-   the required event-to-artifact linkage. Finalization, crash consistency,
-   and recovery behavior remain persistence-design blockers.
+   the required event-to-artifact linkage. The canonical
+   [M1 protocol](../m1-protocol.md) specifies atomic finalization and recovery
+   behavior; these remain unimplemented and unverified.
 7. On storage failure, cancellation, or termination, perform bounded cleanup
    and preserve known execution facts independently from capture completeness.
    Do not claim that cleanup or a failure event can always be persisted.
@@ -53,15 +56,18 @@ The ingestion contract is:
 
 **Negative:**
 - A partial artifact may be insufficient for later interpretation.
-- Staging, finalization, event linkage, and crash recovery need a concrete
-  persistence design.
+- Staging, finalization, event linkage, and crash recovery require correct
+  persistence implementation and verification.
 - Per-run reservation must remain correct under concurrent ingestion.
 
 **Deferred:**
 
-Numeric timeout/resource ceilings, staging-store selection, atomic
-finalization/linkage semantics, crash recovery, retention, and any policy for
-changing limits require the applicable design and deployment evidence.
+Numeric timeout/resource ceilings, retention, and any policy for changing
+limits require applicable design and deployment evidence. The PostgreSQL
+staging, atomic finalization/linkage, reservation accounting, and recovery
+contract is specified in the canonical [M1 protocol](../m1-protocol.md);
+implementation, database enforcement, crash testing, and operational
+verification remain open.
 
 **Revision note:**
 
@@ -79,3 +85,5 @@ implementation or crash-consistency guarantee is implied.
   completeness.
 - [Runtime architecture](../runtime.md) — cancellation and recovery.
 - [Testing strategy](../testing.md) — proposed verification requirements.
+- [M1 protocol](../m1-protocol.md) — canonical transaction, recovery, and
+  accounting mechanics.
