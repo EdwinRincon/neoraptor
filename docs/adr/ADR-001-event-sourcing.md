@@ -43,6 +43,13 @@ The canonical proposed tables, transaction boundaries, artifact protocol, and fa
 
 Projection rebuilds do not recreate or release live execution claims. Replaying domain facts cannot authorize execution or dispatch a worker.
 
+The proposed caller-visible contract for concurrent per-run appends, including
+expected-revision conflicts and stable-event-UUID retry identity, is recorded
+in [ADR-009](ADR-009-concurrent-per-run-event-append.md) and the canonical
+[M1 protocol](../m1-protocol.md). ADR-009 is accepted, not implemented or
+operationally verified; this reference does not change this ADR's accepted
+authority and replay boundaries.
+
 ## Snapshots and projections
 
 Snapshots are deferred until measured recovery cost justifies them. A **query projection** is a derived view optimized for inspection; it may be rebuilt and is not authoritative. A **recovery snapshot**, if introduced later, is a checkpoint of state used to reduce replay work; it does not replace the authoritative event history or make recovery cost independent of snapshot size and subsequent events.
@@ -60,6 +67,7 @@ Event sourcing does not require distributed actors. M1 may use coordinated servi
 ## References
 
 - [M1 deployment and execution protocol](../m1-protocol.md) — selected persistence, transaction, artifact, and recovery design.
+- [ADR-009: Concurrent per-run event append](ADR-009-concurrent-per-run-event-append.md) — proposed append serialization, result, and retry contract.
 - [Proposed M1 schema](../../crates/db/schema.dbml) — descriptive DBML; not a migration or enforcement mechanism.
 - [Domain model](../domain-model.md) — proposed event semantics and recovery.
 - [Runtime architecture](../runtime.md) — dispatch, replay, and restart behavior.

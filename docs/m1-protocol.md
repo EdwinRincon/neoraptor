@@ -246,9 +246,59 @@ but must not acquire a later class and then return to an earlier one. Commit
 each durable transition before calling Docker; never hold a database
 transaction open across Docker operations. Event append checks the expected
 stream revision and assigns the next per-run sequence in the same transaction.
-A failed append or lost commit acknowledgement is not treated as success;
-query by the original idempotency key or inspect the durable claim before any
-retry.
+For admission and dispatch, a failed transaction or lost commit acknowledgement
+is not treated as success; query by the original idempotency key or inspect the
+durable claim before any retry. Event append uses the separate stable-event-UUID
+retry contract below.
+
+#### Per-run event append
+
+This is the proposed M1 append contract; it is not implemented. An append
+request contains the run ID, caller-supplied stable event UUID, expected stream
+revision, event kind, payload, schema version, and actor/reference metadata
+required by that event kind. The expected revision is append-control metadata,
+not part of event-content identity. Persistence-assigned recording metadata is
+also not part of that identity.
+
+Within one transaction, require a valid run and serialize appends for it by
+locking its `runs` row or using an equivalent per-run mechanism. After
+acquiring that serialization, read the current authoritative stream revision
+(the highest accepted event sequence, or zero for an empty stream). First
+resolve an existing event UUID:
+if every caller-supplied immutable event field matches, return the original
+accepted result, even if the retry's expected revision is now stale; if any
+field differs, return `Conflict::EventUuidContentMismatch` without changing
+history. Equality covers the run ID, event UUID, kind, schema version,
+event-kind-required actor/reference metadata, and normalized JSONB payload.
+JSON lexical formatting is not significant: whitespace, key order, escaping,
+and equivalent JSON representations that compare equal as JSONB do not create
+a content mismatch. This is an append-retry identity rule only; JSONB equality
+does not establish provenance, integrity, completeness, or tamper resistance.
+If concurrent requests on different runs race to use the same event UUID, the
+global UUID uniqueness constraint arbitrates the insert; the losing request
+must resolve the stored UUID using these same content rules.
+
+If the UUID has not been accepted, compare the expected revision with the
+current revision. A mismatch returns `Conflict::StaleExpectedRevision` and
+does not append. On a match, assign the next sequence and insert the event in
+the same transaction. Return `Accepted(event_id, run_id, event_sequence,
+stream_revision)` only after the durable commit succeeds; the returned stream
+revision is the new event sequence. The event UUID and `(run_id, event_sequence)`
+uniqueness constraints are backstops, not substitutes for per-run
+serialization. PostgreSQL's default `READ COMMITTED` isolation is sufficient
+for this M1 contract only when every append uses the per-run lock or equivalent
+and checks the revision after acquiring it.
+
+If the commit result is ambiguous, return `Indeterminate` only while the caller
+cannot determine whether the append committed. Retry only with the same event
+UUID and exactly the same structured event content. An accepted matching UUID
+returns its original result without a second insert or sequence change. If the
+original append did not commit, the retry is a normal append and still must
+match the current expected revision. A stale revision requires rereading the
+current authoritative revision; retrying blindly with the old revision is
+forbidden. The caller may retry with a new expected revision or surface the
+structured conflict. Reusing an event UUID with different content is a
+permanent conflict. Append retries never trigger a target-facing action.
 
 For admission, lock the singleton slot before touching the idempotency key.
 An absent-row `SELECT` does not reserve a key. Attempt a unique-constraint

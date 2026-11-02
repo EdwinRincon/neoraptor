@@ -45,15 +45,28 @@ The policy validity interval is half-open: `valid_from <= now < valid_until`. Th
 
 Events are intended to record domain facts; they are not commands. Replaying events rebuilds run state and projections and must never invoke the executor. The proposed envelope contains:
 
-- event ID and run ID;
+- caller-supplied stable event ID and run ID;
 - durable per-run sequence and explicit schema version;
 - recorded timestamp;
 - causation/correlation reference where applicable;
 - probe and attempt references where applicable;
 - policy revision reference where applicable;
-- actor identity where applicable.
+- event-kind-required actor identity and reference metadata.
 
 Timestamps alone do not establish order. PostgreSQL is selected for M1, with expected stream revision and transaction locking required so concurrent writers cannot silently assign conflicting order. This is a design decision, not a claim about an implemented store. A policy-rejection event may reference the policy evaluated, but must not imply that the rejected action was authorized. Only authenticated control-plane ingestion appends accepted events; worker messages are untrusted reports.
+
+The proposed append request supplies the run ID, stable event UUID, expected
+stream revision, kind, payload, schema version, and required actor/reference
+metadata. Event-content identity compares the complete structured
+caller-supplied value, including the normalized JSONB payload; JSON lexical
+formatting is not significant. The expected revision is control metadata, not
+event content. Under per-run serialization, an existing UUID with matching
+content returns its original accepted sequence and revision; different content
+is a permanent conflict. A stale revision fails closed and requires a fresh
+read before any retry with a new revision. An ambiguous commit may be retried
+only with the same UUID and structured content. These are proposed persistence
+rules, not implemented domain behavior; see the [M1 protocol](m1-protocol.md)
+and [ADR-009](adr/ADR-009-concurrent-per-run-event-append.md).
 
 For v0.1, event facts need to distinguish:
 
