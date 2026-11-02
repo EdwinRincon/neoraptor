@@ -28,6 +28,21 @@ credential, proxy, or custom request header. The HTTP client may produce only
 protocol-required headers derived from that fixed endpoint; it does not forward
 browser headers or discover environment proxy settings.
 
+Fixture keys are case-sensitive ASCII matching
+`[A-Za-z0-9][A-Za-z0-9._-]{0,127}` (1–128 UTF-8 bytes). Reject empty keys,
+whitespace, non-ASCII characters, and any other character; do not trim, fold
+case, or normalize. Apply the same validation to the trusted
+`FixtureConfigRevision.fixture_key` and proposed request's `fixture_key`.
+Invalid keys fail structural validation before policy evaluation or
+persistence. The current Rust implementation does not yet enforce the ASCII
+rule; see [current status](plan/STATUS.md).
+
+The complete normalized request value consists of `schema_version`,
+`fixture_key`, `method`, and `fixed_path`, in that conceptual field order.
+M1 compares those typed values exactly; it defines no request-byte encoding
+or request digest. A changed execution-relevant field requires a new request
+identity and fresh evaluation and approval.
+
 M1 disables automatic redirect following and automatic HTTP decompression.
 Response headers are subject to an initial 32 KiB aggregate budget, enforced
 while parsing rather than after an unbounded allocation. Retain only bounded
@@ -235,9 +250,10 @@ retry.
 For admission, lock the singleton slot before touching the idempotency key.
 An absent-row `SELECT` does not reserve a key. Attempt a unique-constraint
 insert with conflict-safe semantics; if another transaction owns the key,
-wait for its result, reread and lock the committed row, then compare the
-canonical normalized request. Return its original result for a match or a
-conflict for changed input. Do not create another attempt or dispatch.
+wait for its result, reread and lock the committed row, then compare every
+field of the complete normalized request value. Return its original result
+for an exact match or a conflict for any mismatch. A mismatch fails closed:
+do not create another attempt or dispatch.
 Admission transactionally writes either a stable busy result with no approval
 or attempt, or the accepted approval/request/attempt binding, slot
 reservation, durable intent, and accepted idempotency result. Commit before
@@ -261,10 +277,11 @@ request:
 | New key while slot is occupied or recovery-disabled | Persist and return `busy`; create no attempt or queued work. |
 | New key with slot available | Atomically accept request, attempt, intent, idempotency result, and slot reservation before live dispatch. |
 
-Retain idempotency keys and their request hashes/results for the deployment
-lifetime in M1. Do not silently expire and reuse a key. A later manual attempt
-uses a new request identity, key, approval, and attempt; a client retry never
-becomes that new attempt.
+Retain idempotency keys, complete normalized request values, and results for
+the deployment lifetime in M1. Do not silently expire and reuse a key. There
+is no request digest in M1. A later manual attempt uses a new request
+identity, key, approval, and attempt; a client retry never becomes that new
+attempt.
 
 An approval binds one exact request identity to its immutable policy revision,
 the fixture-configuration and execution-configuration revisions selected by
@@ -272,13 +289,14 @@ that policy, and the approved resource limits. An attempt must reference the
 same request as its approval. Approval resource limits must satisfy the
 referenced policy and execution-configuration ceilings. An accepted
 idempotency result must reference that mutually consistent request, approval,
-and attempt, and its canonical normalized request data must equal the
+and attempt, and its complete normalized request data must exactly equal the
 referenced immutable request data. A busy result must have no approval or
 attempt and cannot create future work. Enforce these relationships with
 composite unique keys/foreign keys where available and database
 CHECK/transaction enforcement for conditional nullability and structured-data
-equality. Run-ID or request-digest equality alone is insufficient to
-establish exact approval.
+equality. Exact normalized-value equality or run-ID equality alone is
+insufficient to establish exact approval; the declared request/approval
+relationships are required.
 
 There is one broker instance per dedicated host, protected by an exclusive
 OS-level service lock and protected deployment/instance identifiers. No
@@ -315,16 +333,43 @@ worker reports are validated and appended as new facts; they never overwrite
 accepted history. Reconciliation requires explicit evidence and actor
 identity.
 
+#### Authoritative execution outcomes
+
+Execution outcomes are authoritative attempt facts recorded in the ordered
+event history. An `attempt_outcome_recorded` event references its attempt and
+records one value: `not_started`, `completed`, `interrupted`, or `unknown`.
+`not_started` carries exactly one reason: `denied`, `cancelled`, or
+`launch_failed`; other outcomes carry no not-started reason. A denial before
+an attempt exists is not an attempt outcome. `not_established` means no
+accepted outcome fact has established the attempt outcome; it is not an
+outcome event and is distinct from explicit `unknown`.
+
+Record `NotStarted(reason)` only when accepted facts establish the worker did
+not start. A cancellation request alone, ambiguous Docker operation, crash,
+or missing reconciliation evidence cannot establish it; when the available
+facts cannot establish whether execution started or completed, record or
+retain `unknown`. A confirmed stop does not by itself establish that the
+worker never started. Conflicting or unverifiable facts fail closed.
+
+`execution_claims.outcome_knowledge` and its reason, if retained, are
+non-authoritative operational mirrors of accepted outcome events.
+Projections may display or derive views from those events but are not
+authoritative. Replay and projection rebuild apply recorded facts only: they
+cannot create or change an outcome fact, authorize execution, or launch a
+worker. A later reconciliation appends supported facts and preserves prior
+events. Observation availability and evidence completeness remain independent
+from execution outcome.
+
 ### Broker transition contract
 
-The claim stores launch progress, worker presence, cancellation status, and
-attempt outcome knowledge as separate dimensions. Cancellation does not roll
-back launch progress; a confirmed stop can coexist with an unknown execution
-outcome. Only the broker incarnation recorded as owner may advance an active
-claim. No lease-timeout failover or multi-host broker coordination is
-introduced. A new broker may perform startup/historical reconciliation only
-after the previous broker process is confirmed absent and the exclusive host
-lock is acquired; reconciliation never resets an old attempt for launch.
+The claim stores launch progress, worker presence, cancellation status, and a
+non-authoritative outcome mirror as separate dimensions. Cancellation does
+not roll back launch progress; a confirmed stop can coexist with an unknown
+execution outcome. Only the broker incarnation recorded as owner may advance
+an active claim. No lease-timeout failover or multi-host broker coordination
+is introduced. A new broker may perform startup/historical reconciliation
+only after the previous broker process is confirmed absent and the exclusive
+host lock is acquired; reconciliation never resets an old attempt for launch.
 
 All rows below use the transaction lock order defined above, skipping
 irrelevant row classes. The durable state transition commits before any
@@ -543,7 +588,7 @@ cannot be established.
 | Failure point | Known durable facts | Possible target effects | Recovery action | New execution permitted? |
 |---|---|---|---|---|
 | Concurrent duplicate start; same key and request | Original idempotency result and operation | Only effects from the original operation | Return original reference; do not dispatch again | Only if normal slot/readiness checks permit a distinct request |
-| Same key, changed request | Original key/hash/result | No new effect from the conflicting request | Reject conflict; preserve original record | No new attempt from that key |
+| Same key, changed request | Original key, complete normalized request value, and result | No new effect from the conflicting request | Reject any normalized-value mismatch; preserve the original record | No new attempt from that key |
 | Distinct start while busy | Stable `busy` idempotency result; no attempt | Existing worker only | Return busy; caller may later submit a separately approved request with a new key | After slot release and readiness |
 | Failure before intent commit | No accepted intent; transaction is rolled back or outcome is queried by key | None from this attempt | Query original idempotency key; never blindly resubmit with a new key | After reconciliation confirms no accepted operation |
 | Commit acknowledgement lost | Commit may or may not have succeeded | None until live dispatch; after successful commit, dispatch may follow | Query by original key and inspect slot/attempt before further action | Only after durable state is resolved |

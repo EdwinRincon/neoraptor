@@ -49,9 +49,16 @@ Enum cancellation_status {
 
 Enum execution_outcome_knowledge {
   not_established
+  not_started
   completed
   interrupted
   unknown
+}
+
+Enum attempt_outcome_reason {
+  denied
+  cancelled
+  launch_failed
 }
 
 Enum artifact_lifecycle {
@@ -99,8 +106,8 @@ Enum event_kind {
   cancellation_requested
   worker_stopped
   launch_failed
+  attempt_outcome_recorded
   attempt_interrupted
-  outcome_unknown
   reconciliation_recorded
   artifact_finalized
 }
@@ -125,7 +132,7 @@ Table fixture_config_revisions {
   created_by        uuid [not null, ref: > operators.id]
   created_at        timestamptz [not null]
 
-  Note: "Immutable deployment configuration. Database/application constraints must reject changes after creation. IPv4 syntax, port range, endpoint allowlist, and fixed path are validated before readiness."
+  Note: "Immutable deployment configuration. fixture_key uses the M1 ASCII rule [A-Za-z0-9][A-Za-z0-9._-]{0,127}, case-sensitive, without trimming or normalization; request keys use the same validation and must match exactly. Database/application constraints must reject changes after creation. IPv4 syntax, port range, endpoint allowlist, and fixed path are validated before readiness."
 }
 
 Table execution_config_revisions {
@@ -183,7 +190,6 @@ Table probe_requests {
   method            text [not null, default: 'GET']
   fixed_path        text [not null, default: '/']
   normalized_request_data jsonb [not null]
-  request_digest    text [not null]
   created_by        uuid [not null, ref: > operators.id]
   created_at        timestamptz [not null]
 
@@ -191,7 +197,7 @@ Table probe_requests {
     (run_id, id) [unique, name: "uniq_request_run_id"]
   }
 
-  Note: "Execution-relevant normalized request data is immutable; this is not an HTTP request body. Validation permits only the fixed M1 request shape; no caller headers, cookies, credentials, query, body, proxy, URL, or path override."
+  Note: "Execution-relevant normalized request data is immutable and consists exactly of schema_version, fixture_key, method, and fixed_path. Compare the complete normalized value exactly; M1 has no request digest. fixture_key uses the M1 ASCII rule [A-Za-z0-9][A-Za-z0-9._-]{0,127}, case-sensitive, without trimming or normalization. This is not an HTTP request body. Validation permits only the fixed M1 request shape; no caller headers, cookies, credentials, query, body, proxy, URL, or path override."
 }
 
 Table approvals {
@@ -243,7 +249,7 @@ Table execution_attempts {
     (run_id, attempt_number) [unique, name: "uniq_attempt_run_number"]
   }
 
-  Note: "The composite approval reference must authorize this exact request, not merely share its run or digest. Authoritative lifecycle/outcome facts remain events. A manual retry is a separately approved request and a new attempt."
+  Note: "The composite approval reference must authorize this exact request identity; normalized-value equality or sharing its run is not sufficient. Authoritative lifecycle/outcome facts remain events. A manual retry is a separately approved request and a new attempt."
 }
 
 Table start_idempotency {
@@ -252,7 +258,6 @@ Table start_idempotency {
   operation                text [not null, default: 'start']
   idempotency_key          text [not null]
   normalized_request_data  jsonb [not null]
-  request_digest           text [not null]
   outcome                  idempotency_outcome [not null]
   run_id                   uuid [not null, ref: > runs.id]
   request_id               uuid [not null]
@@ -264,7 +269,7 @@ Table start_idempotency {
     (operator_id, operation, idempotency_key) [unique, name: "uniq_idempotency_scope_key"]
   }
 
-  Note: "Authenticate before lookup. Retain records for deployment lifetime; never silently expire/reuse a key. An accepted result references the mutually consistent request, approval, and attempt, and normalized_request_data equals the immutable request data; a busy result has null approval/attempt and no future work. Enforce outcome/nullability with a database CHECK, structured-data equality and policy-limit checks transactionally, and relationships with the declared composite references; DBML does not enforce these conditions."
+  Note: "Authenticate before lookup. Retain the complete normalized request value and result for deployment lifetime; M1 uses exact normalized-value equality and has no request digest. Never silently expire/reuse a key. An accepted result references the mutually consistent request, approval, and attempt, and normalized_request_data exactly equals the immutable request data; any mismatch conflicts and fails closed. A busy result has null approval/attempt and no future work. Enforce outcome/nullability with a database CHECK, structured-data equality and policy-limit checks transactionally, and relationships with the declared composite references; DBML does not enforce these conditions."
 }
 
 Table broker_instances {
@@ -286,6 +291,7 @@ Table execution_claims {
   worker_presence         worker_presence [not null]
   cancellation_status     cancellation_status [not null]
   outcome_knowledge       execution_outcome_knowledge [not null]
+  outcome_reason          attempt_outcome_reason
   broker_instance_id      uuid [ref: > broker_instances.id]
   worker_identity         uuid [not null, unique]
   container_id            text [unique]
@@ -296,7 +302,7 @@ Table execution_claims {
   claimed_at              timestamptz
   updated_at              timestamptz [not null]
 
-  Note: "Mutable live coordination state, not replay-derived authority. The broker owner is null while reserved and assigned once at claim. Keep launch progress, cancellation, worker presence, and attempt outcome knowledge separate; worker stop may coexist with unknown outcome. Outcome knowledge is synchronized with, but never replaces, authoritative attempt events. Only the owning broker incarnation advances a live claim. Persist worker identity before creation. Exact container ownership requires verified stored identity/labels and container ID; a name prefix alone is insufficient. Wall-clock timestamps are reporting data, not enforcement timers."
+  Note: "Mutable live coordination state, not replay-derived authority. The broker owner is null while reserved and assigned once at claim. Keep launch progress, cancellation, worker presence, and outcome mirror separate; worker stop may coexist with unknown outcome. outcome_knowledge and outcome_reason are a non-authoritative mirror of accepted attempt_outcome_recorded events: not_established has no reason; not_started requires exactly one of denied, cancelled, launch_failed; completed, interrupted, and unknown have no reason. Never infer outcome from observation availability/completeness. Only the owning broker incarnation advances a live claim. Persist worker identity before creation. Exact container ownership requires verified stored identity/labels and container ID; a name prefix alone is insufficient. Wall-clock timestamps are reporting data, not enforcement timers."
 }
 
 Table deployment_execution_slot {
@@ -329,7 +335,7 @@ Table run_events {
     (run_id, recorded_at) [name: "idx_run_event_time"]
   }
 
-  Note: "Explicit schema version from first persisted event. Payload excludes artifact bytes. Events are immutable accepted facts; database roles/constraints must deny update/delete. Pre-approval events may have null policy/request/attempt references. Enforce actor-kind identity requirements and append next sequence under expected-revision transaction locking."
+  Note: "Explicit schema version from first persisted event. Payload excludes artifact bytes. Events are immutable accepted facts; database roles/constraints must deny update/delete. Pre-approval events may have null policy/request/attempt references. An attempt_outcome_recorded event must reference an existing attempt in the same run and carry outcome_knowledge (not_started, completed, interrupted, or unknown); not_started requires exactly one outcome_reason (denied, cancelled, launch_failed), and other outcomes require no reason. not_established is an initial claim mirror state, not an outcome event. This event is the sole event kind that records an attempt outcome; launch_failed and attempt_interrupted remain supporting facts. Accepted outcome events are authoritative; execution_claims mirrors them non-authoritatively. Outcome does not derive from attempt_observations availability or artifact completeness. Replay/projection rebuild applies recorded facts only and cannot create/change outcomes, authorize execution, or launch a worker. Enforce actor-kind identity requirements and append next sequence under expected-revision transaction locking."
 }
 
 Table run_projections {
@@ -450,7 +456,7 @@ Ref: artifact_event_links.(run_id, event_id) > run_events.(run_id, id)
 //
 // DBML is descriptive. Its notes do not enforce append-only facts, immutable
 // configuration, singleton rows, state transitions, byte ceilings, approval/
-// request/attempt identity, outcome/nullability combinations, artifact
+// request/attempt identity, outcome/event/reason/mirror consistency, artifact
 // lifecycle/completeness combinations, actor checks, serialization, or
 // transactional finalization. The eventual PostgreSQL migration/application
 // must implement and test these constraints, privileges, locking order, and
