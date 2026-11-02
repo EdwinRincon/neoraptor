@@ -12,8 +12,21 @@ implementation authorization.
 
 - `Cargo.toml` identifies package `neoraptor` version `0.1.0`, edition
   `2024`, with an empty dependency section.
-- `src/main.rs` only prints `Hello, world!`; the repository is a scaffold, not
-  a working assessment platform.
+- `src/main.rs` still prints `Hello, world!`; `src/lib.rs` exports only the
+  pure `src/domain.rs` module. `src/domain_invariants.rs` contains its
+  `#[cfg(test)]` unit tests. The domain implements fixed-request validation,
+  identity/approval binding, resource-limit checks, authorization decisions,
+  Run lifecycle values, and separate execution-outcome and observation values.
+  No assessment workflow is implemented.
+- `ExecutionAttempt` remains an identity/binding value; its lifecycle
+  transitions are deferred. The mapping of domain `NotStarted(reason)` to the
+  proposed persistence `execution_outcome_knowledge` enum remains unresolved.
+- The in-memory fixture-key bound is 1–128 UTF-8 bytes and provisional. It is
+  not specified by the canonical protocol or proposed schema. The accepted
+  character set is also unresolved; current pure validation accepts any
+  non-empty valid UTF-8 key within the byte bound. Confirm both before
+  persistence or API exposure. Request canonicalization and digest semantics
+  are not implemented.
 - `rust-toolchain.toml` pins Rust `1.95.0`.
 - `docs/product.md` records unvalidated customer and differentiation
   hypotheses, future product directions, and customer-outcome measures.
@@ -33,22 +46,23 @@ implementation authorization.
 
 ## Current work and review state
 
-The current review tightens exact request/approval/attempt/idempotency
-relationships, separates artifact lifecycle from observation completeness,
-defines broker transitions and lock order, specifies conservative start-time
-deadlines and authenticated stream termination, and separates implementation
-readiness from fixture-execution readiness. These remain design contracts,
-not implemented mechanisms or passing tests.
-
-Task-start copies of the files in the current permitted scope are retained
-outside the repository. The task-specific diff is generated against those
-copies, not against `HEAD` or the combined worktree diff.
+The pure domain slice validates the fixed request shape, half-open policy
+validity, exact run/request/policy/configuration/approval bindings, and
+approved resource limits against policy and execution-configuration ceilings.
+Authorization inputs and approval resource limits are required by the Rust
+types. Attempt binding has its own error type. `CheckObservation` directly
+represents observed HTTP status; outcome and observation remain independent.
+It models only the documented Run lifecycle as an in-memory value; current
+persisted run state remains event/projection work. Attempt lifecycle,
+persistence, resource accounting/enforcement, execution, event handling,
+artifacts, and recovery are not implemented. Outcome types are domain-only
+and have no persistence conversion.
 
 ## M1 readiness gates
 
 | Gate | State | Evidence or blocker |
 |---|---|---|
-| A. Domain/storage implementation readiness | Ready for a separately authorized bounded implementation task; this is not implementation authorization. | The protocol/schema specify exact approval and idempotency binding, ordered event writes, artifact lifecycle/completeness/accounting, and transaction/lock behavior. Proposed tests cover these invariants. |
+| A. Domain/storage implementation readiness | Partial pure-domain slice implemented and unit tested; gate remains open. | Review request canonicalization/digest and fixture-key byte/character rules before persistence/API exposure. Persistence, artifact lifecycle/accounting, event ordering, idempotency, and their tests remain unimplemented. Domain `NotStarted(reason)` to persistence enum mapping is unresolved; no conversion is implemented. |
 | B. Broker/network implementation readiness | Blocked. | Review and validate the supported host/kernel/Docker/firewall compatibility target, broker privilege/identity boundary, concrete network enforcement specification, ownership/reconciliation, and cancellation/deadline behavior. |
 | C. Controlled fixture execution readiness | Blocked. | Requires relevant broker/network and storage safeguards implemented and inspected on the selected host, with representative negative reachability and recovery/cleanup evidence. A finished SvelteKit UI is not required; an authenticated integration-test client may exercise the backend. |
 | D. Full M1 acceptance | Blocked. | Requires reviewed backend, evidence, failure/recovery, network, and frontend acceptance evidence. No M1 acceptance tests have run. |
@@ -73,18 +87,24 @@ without granting current execution permissions.
 
 ## Validation evidence and scope
 
-Validation performed: `git diff --check` passed; relative Markdown links in
-the nine edited Markdown files resolve; and a structural check found no
-missing DBML reference columns or non-unique reference targets across 20
-tables. This is not DBML parser validation. No application build, application
-test, controlled fixture test, security verification, live deployment, or
-SQL migration is claimed. Workflow configuration was not inspected; configured
-CI checks and their results remain pending verification.
+Validation for the current pure-domain slice: `cargo fmt --all -- --check`,
+`cargo test --workspace` (32 tests passed), and
+`cargo clippy --all-targets --all-features -- -D warnings` passed.
+`cargo run --quiet` still prints `Hello, world!`; `git diff --check` passed.
+No controlled fixture test, security verification, live deployment, SQL
+migration, or persistence behavior is claimed. Earlier structural checking
+found no missing DBML reference columns or non-unique reference targets across
+20 tables; this is not DBML parser validation. Workflow configuration was not
+inspected; configured CI checks and their results remain pending verification.
 
 ## Next eligible task
 
-After accepting this design review, a separately authorized task may implement
-only the Domain/storage readiness slice (A). Broker/network work, controlled
-fixture execution, and full M1 acceptance remain gated independently as
-recorded above. M0 remains incomplete until its recorded exit criteria are
-satisfied.
+Before persistence/API exposure, resolve request canonicalization/digest
+semantics and confirm the provisional fixture-key bound and character syntax
+against the canonical protocol. Continue the domain/storage readiness review
+for remaining persistence, event, artifact, and idempotency semantics. Do not
+implement outcome persistence until the mapping between domain
+`NotStarted(denied|cancelled|launch_failed)` and proposed
+`execution_outcome_knowledge` is decided. Broker/network work, controlled
+fixture execution, and full M1 acceptance remain separately gated. M0 remains
+incomplete until its recorded exit criteria are satisfied.

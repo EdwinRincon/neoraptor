@@ -2,24 +2,28 @@
 
 ## Purpose and status
 
-This document defines proposed domain concepts for NEORAPTOR's restricted v0.1 workflow. The project is currently a scaffold; these are design descriptions, not implemented Rust types, guarantees, or test results. The earlier name `ScopeContract` referred to the policy intent now called `ScopePolicy`; it is not a cryptographic safety boundary.
+This document defines domain concepts for NEORAPTOR's restricted v0.1 workflow. A bounded pure-domain subset—fixed request validation, request/policy/configuration/approval identity binding, validated resource limits, authorization decisions with structurally required inputs, Run lifecycle values, and separate execution-outcome and observation values—is implemented in [`src/domain.rs`](../src/domain.rs). `ExecutionAttempt` remains an identity/binding value only; its lifecycle is deferred. The mapping of domain `NotStarted(reason)` to the proposed persistence `execution_outcome_knowledge` enum remains unresolved; no persistence or execution guarantee is implied. Other concepts remain design descriptions, not implemented mechanisms or test results. The earlier name `ScopeContract` referred to the policy intent now called `ScopePolicy`; it is not a cryptographic safety boundary.
 
 See [product direction](product.md) for the long-term workflow, [milestones](plan/INDEX.md) for current permissions and distinct gates, [current status](plan/STATUS.md) for verified implementation state, and the [canonical M1 protocol](m1-protocol.md) for selected persistence and execution semantics.
 
 The v0.1 path is one operator-triggered, predefined read-only HTTP observation against a dedicated local test fixture selected by a trusted configuration identifier. No request or planner may supply or redefine the endpoint. Local does not mean inherently safe: the request may create server-side effects such as logs. Broader authorized testing remains future product direction.
 
+The pure request type accepts schema version 1 and only `GET /`, with a non-empty fixture key of 1–128 UTF-8 bytes. Both the byte bound and accepted character set are provisional: the canonical protocol and proposed schema do not specify them. The current domain accepts any valid UTF-8 string meeting the byte bound; decide a canonical key syntax before persistence or API exposure. The domain type represents the normalized fixed request fields but does not define serialized canonicalization or a request digest.
+
+Pure `ResourceLimits` construction rejects zero execution runtime, zero connect timeout, a connect timeout longer than the execution runtime, and zero worker memory/CPU/process limits. Byte budgets may be zero; they are caps, not accounting or evidence guarantees. Policy validity uses the half-open interval `valid_from <= now < valid_until`.
+
 ## Canonical concepts
 
 | Concept | Responsibility |
 |---|---|
-| `Run` | Identify one operator-triggered workflow and its lifecycle. |
+| `Run` | Identify one operator-triggered workflow and its lifecycle. The pure value supports the documented lifecycle transitions; persisted authoritative state remains event/projection work. |
 | `ScopePolicy` | Immutable, run-specific policy revision describing the permitted fixture, check capability, validity, approval, and resource limits. A change creates a new revision. |
 | `ProbeRequest` | Structured request for the one supported check, including the fixture identifier and parameters. Execution-relevant contents are immutable through the public API; a change is a new request. |
 | `Approval` | Bind one exact request to its immutable policy and fixture/execution configuration revisions and approved resource limits. A run match or digest match alone is insufficient. |
-| `AuthorizationDecision` | Record whether that exact request is permitted under a particular policy revision, fixture-configuration revision, and relevant execution-configuration revision. It is not a reusable execution token. |
-| `ExecutionAttempt` | Track one prepared/dispatch attempt, lifecycle, and execution outcome; its approval must authorize its exact request. M1 permits one active target-facing attempt; acquire its execution slot before launch and retain it until worker stop/absence and required cleanup are established. An unknown outcome does not release a possibly running worker's slot. |
+| `AuthorizationDecision` | Record a pure evaluation result for that exact request, approval, policy revision, fixture-configuration revision, and execution-configuration revision. It is not a reusable execution token and does not replace the broker's final execution-time check. |
+| `ExecutionAttempt` | Bind an attempt identity to its exact request and approval. The value type is implemented, but lifecycle, dispatch, recovery, and execution-outcome transitions are deferred; M1's one-active-attempt and slot-release requirements are not implemented. |
 | `ArtifactMetadata` | Reference persisted bounded evidence; artifact lifecycle (staging/finalized), observation availability/completeness, capture reason, and attempt execution outcome are separate dimensions. It does not contain a live stream. |
-| `CheckResult` | Record the observed HTTP-check outcome without asserting a vulnerability. |
+| `CheckObservation` | Record the observed HTTP status without asserting a vulnerability. |
 | `FindingValidation` | Apply explicit check-specific criteria to evidence; may be confirmed, rejected, or inconclusive. Not part of the v0.1 HTTP-observation conclusion. |
 | `EventEnvelope` | Give a recorded domain fact identity, per-run order, schema version, and relevant causality/authorization references. |
 
@@ -117,6 +121,8 @@ Staging -> Finalized
 ```
 
 A dispatch-intent event is not evidence that the worker started. Recovery may record an unresolved attempt as unknown but must not execute it again. Later reconciliation appends a new actor-attributed fact with explicit evidence; the original unknown event remains in history. A late worker report is ingested as a new fact and cannot silently rewrite accepted history. A confirmed worker stop may coexist with an unknown execution outcome; release the slot only after stop/absence and required cleanup are established. A new manual attempt is a distinct attempt ID and does not erase the old outcome.
+
+The in-memory `Run` value implements only `Created -> Active -> Completed | Aborted | NeedsReconciliation`; it is not a mutable database status or event store. Attempt lifecycle transitions remain deferred because dispatch, claim, pre-start terminal-state, and recovery semantics are outside this pure-domain change. No attempt can be launched or recovered through the value type.
 
 ## Deferred concepts and limitations
 
