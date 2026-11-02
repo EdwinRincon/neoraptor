@@ -1,131 +1,59 @@
-# ADR-003: Fail-Closed ScopeContract Governance
+# ADR-003: Fail-Closed Authorization and Execution Enforcement
 
 **Status:** Accepted
 
 **Date:** 2026-05-31
 
-**Context:**
+## Context
 
-NEORAPTOR executes potentially destructive security tools. Without strict governance, we risk:
+NEORAPTOR is intended to orchestrate authorized security assessments. A request can be structurally valid but not authorized; an earlier authorization decision can also become stale before execution. The initial implementation milestone is restricted to a dedicated local HTTP fixture and one predefined observation check.
 
-1. **Accidental over-scoping**: Testing unauthorized targets (legal/compliance risk)
-2. **Scope drift**: Initial authorization expands without explicit approval
-3. **Execution-time surprises**: Policy violations discovered only after tool runs
+The original proposal centered enforcement at planning time and claimed compile-time protection from `ScopeContract` ownership and typestate. Those mechanisms alone do not ensure current permission at the execution boundary.
 
-**Decision:**
+## Decision
 
-Enforce `ScopeContract` at **planning time** using fail-closed semantics:
+Use `ScopePolicy` for an immutable, per-run policy revision. A policy decision binds to the exact `ProbeRequest`, policy revision, fixture-configuration revision, and relevant execution-configuration revision. A changed request or configuration requires reevaluation before dispatch. An authorization decision is not a permanent execution token.
 
-1. Every probe must pass `ScopeContract.allows_probe()` before dispatch
-2. Policy violations **abort** at planning time — probes never reach the execution plane
-3. `ScopeContract` is **not** `Clone` — constructed only via typestate builder at startup
-4. Missing `allowed_targets` is a **hard startup failure** (no "empty = allow all" default)
+Enforcement has four distinct stages:
 
-**Consequences:**
+1. **Structural validation** checks syntax, bounds, supported capability, and parameter schema. It does not imply authorization.
+2. **Policy evaluation** determines whether the exact request is permitted by a specific policy revision and records allow or deny. A rejection may reference the policy evaluated without implying authorization.
+3. **Final execution-time permission** immediately before target-facing work verifies the current policy and configuration revisions, revocation status, run state, exact request identity, required approval, validity window, resource budget, fixture mapping, and execution configuration using a trusted clock.
+4. **Execution-boundary restrictions** constrain the broker and worker to the permitted fixture, supported capability, and reviewed resource limits. Policy checks do not replace network or worker restrictions.
 
-**Positive:**
-- **Fail-closed by default**: Policy violations are caught early, not at execution time
-- **No silent over-scoping**: Missing scope fields cause build errors, not runtime surprises
-- **Audit trail**: Every probe links to `authorization_id`, making actions traceable
-- **Type safety**: `ScopeContract` cannot be cloned or bypassed in control-plane code
+For the restricted fixture milestone, the fixture identifier resolves only through trusted configuration. The request and planner cannot redefine the endpoint. Policy creation for an authorized new run is permitted during service operation; previously approved policy revisions are not silently mutated. A policy denial or failed final check blocks dispatch.
 
-**Negative:**
-- **Startup complexity**: Typestate builder adds boilerplate
-- **Ergonomics**: Cannot pass `ScopeContract` by value (must use `&ScopeContract`)
-- **Error handling**: Policy violations require explicit handling (cannot be ignored)
+## Required configuration and semantic validity
 
-**Alternatives Considered:**
+Required-field presence and semantic validity are separate. A missing required value must be rejected during construction/configuration validation. Present values must still be checked for semantic consistency, including valid time bounds, supported capability, fixture mapping, and resource limits. Empty or malformed values must not silently mean “allow all.”
 
-1. **Execution-time validation**: Check scope in executor → allows probes to be planned but not run (confusing UX)
-2. **Optional scope**: `Option<ScopeContract>` with `None = allow all` → silent over-scoping risk
-3. **Runtime scope mutations**: Allow adding targets dynamically → audit trail fragmentation
+No particular authentication mechanism, storage mechanism, or builder/typestate pattern is selected by this ADR.
 
-**Implementation Notes:**
+## Consequences
 
-- `ScopeContract` is constructed via `ScopeContractBuilder` with required fields
-- Builder fails at `build()` if any required field is missing
-- Validation errors are logged as `ProbeAborted` events (not `ProbeFailed`)
+### Positive
 
-**Example:**
+- Structural validity, policy authorization, and permission to execute now are not conflated.
+- Authorization is tied to the content and revisions that were actually evaluated.
+- Configuration changes and revocation can block stale queued work at the execution boundary.
+- The broker/worker restrictions remain an independent enforcement layer.
 
-```rust
-// This fails at startup (missing allowed_targets):
-let scope = ScopeContractBuilder::new()
-    .authorization_id(Uuid::new_v4())
-    // .allowed_targets(...)  ← MISSING
-    .build(); // ERROR: MissingAllowedTargets
+### Trade-offs
 
-// This fails at planning time (unauthorized target):
-let probe = ProbeSpec::<PortScanProbe, 1>::new(
-    Target { ip: "10.0.0.1".parse()?, domain: None },
-    vec![],
-);
-scope.allows_probe(&probe)?; // ERROR: UnauthorizedTarget
-```
+- The final check depends on current policy/configuration state and a trusted clock.
+- A check immediately before work narrows but does not eliminate races unless the execution protocol coordinates policy changes and dispatch.
+- Cancellation cannot reverse target-side effects already produced.
+- Every implementation path to target-facing execution must enforce the same checks; type signatures and ownership patterns do not prove this.
 
-**Security Implications:**
+## Verification requirements
 
-- Fail-closed semantics prevent accidental over-scoping
-- Operators must explicitly add targets to `allowed_targets` (no wildcards)
-- Time windows (`valid_from`, `valid_until`) enforce temporal scoping
-- **Typestate pattern**: `ScopeContractBuilder` enforces required fields at compile time
+Before controlled fixture execution, define and verify tests for malformed and unsupported requests, exact request/policy/fixture-configuration binding, configuration revision changes, expiry and revocation before dispatch, and destination/capability restrictions at the execution boundary. These are requirements, not claimed tests or implementation results.
 
-**Typestate enforcement (aligned with ADR-006):**
+## Revision note
 
-```rust
-// State markers (sealed)
-pub struct NoTargets;
-pub struct HasTargets;
+This revision supersedes planning-only enforcement, the fixed startup `ScopeContract`, the claim that `Clone`/`Arc` prevents bypass, and compile-time typestate guarantees as the security boundary. It retains fail-closed authorization as the design intent and the historical decision date.
 
-pub struct ScopeContractBuilder<State> {
-    authorization_id: Uuid,
-    allowed_targets: Option<BTreeSet<IpNet>>,
-    // ...
-    _state: PhantomData<State>,
-}
+## References
 
-impl ScopeContractBuilder<NoTargets> {
-    pub fn new(authorization_id: Uuid) -> Self {
-        ScopeContractBuilder {
-            authorization_id,
-            allowed_targets: None,
-            _state: PhantomData,
-        }
-    }
-
-    pub fn allowed_targets(mut self, targets: BTreeSet<IpNet>) -> ScopeContractBuilder<HasTargets> {
-        ScopeContractBuilder {
-            authorization_id: self.authorization_id,
-            allowed_targets: Some(targets),
-            _state: PhantomData,
-        }
-    }
-    
-    // No build() method on NoTargets state!
-}
-
-impl ScopeContractBuilder<HasTargets> {
-    pub fn build(self) -> ScopeContract {
-        ScopeContract {
-            authorization_id: self.authorization_id,
-            allowed_targets: self.allowed_targets.unwrap(),  // Safe - HasTargets guarantees Some
-            // ...
-        }
-    }
-}
-
-// Compile-time enforcement:
-let scope = ScopeContractBuilder::new(uuid)
-    .build(); // ❌ ERROR: no method `build` for ScopeContractBuilder<NoTargets>
-
-let scope = ScopeContractBuilder::new(uuid)
-    .allowed_targets(targets)
-    .build(); // ✅ OK: HasTargets state has build()
-```
-
-**Rationale:** This aligns `ScopeContractBuilder` with the same typestate pattern used in `InfraHandlesBuilder` (ADR-006). For an offensive-security control plane, the governance boundary deserves compile-time guarantees, not runtime `Result` checks.
-
-**References:**
-
-- [security.md](../security.md) — ScopeContract enforcement and governance
-- [domain-model.md](../domain-model.md) — ScopeContract structure
+- [Security architecture](../security.md) — proposed policy and execution controls.
+- [Domain model](../domain-model.md) — `ScopePolicy`, `ProbeRequest`, and authorization decisions.

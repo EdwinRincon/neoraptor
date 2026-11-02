@@ -1,4 +1,4 @@
-# ADR-002: Typed Probes with Const Generics
+# ADR-002: Structured Action Requests and Explicit Schema Versioning
 
 **Status:** Accepted
 
@@ -6,103 +6,83 @@
 
 **Context:**
 
-NEORAPTOR generates and executes vulnerability probes across multiple versions of the codebase. Probe fingerprints (used for deduplication) evolve over time as we refine what constitutes a "unique" probe.
-
-**Problem:**
-
-If fingerprint schemas change (e.g., V1: `(IP, port)` → V2: `(IP, port, protocol)`), we risk:
-
-1. **Silent collisions**: V1 and V2 fingerprints stored in the same deduplication map
-2. **False deduplication**: Different probes (V1 vs V2) treated as identical
-3. **Runtime errors**: Type mismatches caught only at runtime via `match` or `downcast`
+NEORAPTOR needs a stable representation of an authorized action request and
+of persisted request data. Validation must reject unsupported or malformed
+parameters before dispatch. A versioned request schema helps interpret stored
+data, but does not by itself establish authorization, identity, or
+deduplication semantics.
 
 **Decision:**
 
-Encode the vulnerability class and fingerprint schema version in the `ProbeSpec` type via a phantom type `P` and const generic `V`:
+1. Represent actions as structured requests validated against an explicit
+   schema at runtime before dispatch.
+2. Keep execution-relevant request content immutable through the public API;
+   changing such content creates a distinct request requiring fresh policy
+   evaluation and final execution permission.
+3. Persist an explicit schema version with stored request data from its first
+   persisted representation.
+4. Treat type separation, if used, as a way to prevent selected API mistakes.
+   It does not replace runtime validation, authorization, execution-boundary
+   checks, or persistence/recovery rules.
 
-```rust
-pub struct ProbeSpec<P: VulnerabilityClass, const V: u32> {
-    // ... fields
-    _phantom: PhantomData<P>,
-}
-```
-
-Deduplication is parameterized by the same types:
-
-```rust
-pub struct ProbeDeduplicator<P: VulnerabilityClass, const V: u32> {
-    seen: HashSet<P::Fingerprint>,
-}
-```
+M1 does not require vulnerability-class phantom parameters, const-generic
+fingerprint versions, macro-generated probe types, or multi-schema
+deduplicator machinery. Their use requires a separate demonstrated need and
+design review.
 
 **Consequences:**
 
 **Positive:**
-- **Compile-time safety**: Cross-version fingerprint collisions are **type errors**
-- **Explicit versioning**: Schema version is part of the type signature
-- **Zero-cost abstraction**: Phantom types and const generics have no runtime overhead
-- **Migration path**: V1 → V2 requires explicitly creating new `ProbeSpec<P, 2>` instances
-- **Fingerprint type safety**: `Hash + Eq` supertraits enforce hashability at trait impl site
+- Structured request data has an explicit validation boundary and persisted
+  schema version.
+- Public API immutability makes execution-relevant request changes explicit.
+- Runtime validation remains a first-class correctness and security check;
+  compile-time type distinctions are optional assistance, not a substitute.
 
-**Trait definition:**
+**Limitations:**
 
-```rust
-use std::hash::Hash;
+- An explicit schema version does not define future migration policy or
+  guarantee compatibility.
+- A type distinction may prevent selected accidental substitutions but
+  cannot prove that a request is authorized or semantically safe.
+- A const parameter alone does not define fingerprint fields, normalization,
+  equality, canonicalization, or version-transition semantics.
 
-pub trait VulnerabilityClass {
-    /// Fingerprint type for deduplication. Must implement Hash + Eq.
-    /// 
-    /// # Compile-time enforcement
-    /// The Hash + Eq supertraits ensure that any type used as a Fingerprint
-    /// is hashable. This catches errors at the trait impl site, not at the
-    /// ProbeDeduplicator instantiation site (which may be in macro-generated code).
-    type Fingerprint: Hash + Eq;
-}
-```
+**Identity and duplicate handling:**
 
-**Rationale:** Without `Hash + Eq` supertraits, a `VulnerabilityClass` implementor could define `type Fingerprint = SomeCustomStruct` without deriving `Hash`, causing errors at deduplicator instantiation time (potentially inside generated macro code) rather than at the trait impl site.
+Keep these cases distinct:
 
-**Negative:**
-- **Type complexity**: `ProbeSpec<PortScanProbe, 1>` vs `ProbeSpec<PortScanProbe, 2>` are different types
-- **Deduplicator proliferation**: One deduplicator per `(P, V)` pair
-- **Ergonomics**: Type parameters must be specified at every call site
+- A **hash collision** occurs when unequal fingerprint values produce the
+  same hash; equality must still distinguish the values.
+- **Logical fingerprint aliasing** occurs when semantically different actions
+  are assigned the same fingerprint/equality identity by the chosen
+  canonicalization rules.
+- A **duplicate client request** is repeated API input and needs request
+  idempotency semantics.
+- **Duplicate dispatch delivery** is repeated delivery of an execution
+  command and needs an execution-claim/dispatch protocol.
 
-**Alternatives Considered:**
+M1 request idempotency and broker execution claims require their own protocol;
+fingerprint typing or schema versioning does not resolve them. Their design
+and failure behavior remain blockers.
 
-1. **Runtime version tag**: Store version as a field, check at runtime → loses compile-time safety
-2. **Trait objects**: `Box<dyn VulnerabilityClass>` → loses const generic, requires `dyn` overhead
-3. **Macro-generated types**: `probe_v1!()`, `probe_v2!()` → harder to maintain, less discoverable
+**Revision note:**
 
-**Implementation Notes:**
-
-- Const generic `V` is **not** derived from `P` (different probes can share schema versions)
-- Migration from V1 to V2 is **explicit**: planners must construct `ProbeSpec<P, 2>` when ready
-- Event log stores version tag alongside probe data for replay compatibility
-
-**Example:**
-
-```rust
-// V1 fingerprint: IP + port
-pub struct PortScanProbeV1;
-impl VulnerabilityClass for PortScanProbeV1 {
-    type Fingerprint = (IpAddr, u16);
-}
-
-// V2 fingerprint: IP + port + protocol
-pub struct PortScanProbeV2;
-impl VulnerabilityClass for PortScanProbeV2 {
-    type Fingerprint = (IpAddr, u16, Protocol);
-}
-
-// This compiles:
-let dedup_v1 = ProbeDeduplicator::<PortScanProbeV1, 1>::new();
-
-// This does NOT compile (type mismatch):
-let dedup_v2 = ProbeDeduplicator::<PortScanProbeV2, 2>::new();
-dedup_v2.insert((ip, port)); // ERROR
-```
+This revision supersedes the earlier claim that const-generic versions
+universally prevent fingerprint collisions, the prescribed
+`ProbeSpec<P, V>`/`ProbeDeduplicator<P, V>` machinery and snippets, and
+macro-generated probe-type examples. It defers vulnerability-class phantom
+parameters, const-generic fingerprint versions, macro generation, and
+multi-schema deduplicators while retaining structured requests, explicit
+schemas, runtime parameter validation, immutable execution-relevant request
+content, and persisted schema versioning. The original decision date is
+preserved. Acceptance records a design decision, not an implemented
+capability.
 
 **References:**
 
-- [domain-model.md](../domain-model.md) — ProbeSpec structure and typestate
-- [testing.md](../testing.md) — Macro stability tests for trait-variant macros
+- [Domain model](../domain-model.md) — proposed request and authorization
+  semantics.
+- [Security architecture](../security.md) — runtime authorization and final
+  execution permission.
+- [Testing strategy](../testing.md) — proposed M1 test specifications.

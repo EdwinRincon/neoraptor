@@ -1,281 +1,457 @@
 Project Neoraptor {
   database_type: "PostgreSQL"
+  Note: "Proposed M1 schema only. No migration or database implementation exists. See docs/m1-protocol.md for transaction, privilege, recovery, and constraint requirements that DBML notes do not enforce."
 }
 
-Enum run_status {
-  initiated
+Enum actor_kind {
+  operator
+  control_service
+  broker
+  worker_report
+}
+
+Enum idempotency_outcome {
+  accepted
+  busy
+}
+
+Enum execution_slot_state {
+  enabled
+  recovery_disabled
+}
+
+Enum launch_progress {
+  reserved
+  claimed
+  launch_authorized
+  create_requested
+  container_created
+  start_requested
+  worker_started
+  launch_failed
+}
+
+Enum worker_presence {
+  not_created
+  creation_unknown
+  created
+  start_unknown
   running
+  stopped
+  absent
+  ownership_unknown
+}
+
+Enum cancellation_status {
+  not_requested
+  requested
+}
+
+Enum execution_outcome_knowledge {
+  not_established
   completed
-  aborted
+  interrupted
+  unknown
+}
+
+Enum artifact_lifecycle {
+  staging
+  finalized
+}
+
+Enum capture_completeness {
+  complete
+  incomplete
+}
+
+Enum observation_availability {
+  unavailable
+  complete
+  incomplete
+}
+
+Enum capture_reason_code {
+  source_unavailable
+  source_error
+  cap_exceeded
+  worker_terminated
+  persistence_failure
+  recovery_interrupted
+  integrity_failure
 }
 
 Enum event_kind {
-  run_initiated
-  run_completed
-  run_aborted
-  target_discovered
-  probe_dispatched
-  probe_completed
-  probe_failed
-  finding_confirmed
-  false_positive
-  escalation_proposed
-  escalation_transitioned
-  coverage_updated
-  artifact_truncated
-  probe_shed
+  run_created
+  request_proposed
+  policy_evaluated
+  start_busy
+  approval_recorded
+  policy_revoked
+  attempt_prepared
+  dispatch_intent
+  execution_claimed
+  launch_authorized
+  launch_denied
+  worker_created
+  worker_started
+  observation_recorded
+  capture_incomplete
+  cancellation_requested
+  worker_stopped
+  launch_failed
+  attempt_interrupted
+  outcome_unknown
+  reconciliation_recorded
+  artifact_finalized
 }
 
-Enum finding_status {
-  pending
-  confirmed
-  disputed
-  false_positive
+Table operators {
+  id              uuid [pk]
+  identity_name   text [not null, unique]
+  active          boolean [not null, default: true]
+  created_at      timestamptz [not null]
+
+  Note: "Contains identity references only. Never store bearer credential material here."
 }
 
-Enum escalation_state {
-  proposed
-  approved
-  disputed
-  superseded
+Table fixture_config_revisions {
+  id                uuid [pk]
+  revision          integer [not null, unique]
+  fixture_key       text [not null]
+  endpoint_ipv4     text [not null]
+  endpoint_port     integer [not null]
+  fixed_path        text [not null, default: '/']
+  config_digest     text [not null, unique]
+  created_by        uuid [not null, ref: > operators.id]
+  created_at        timestamptz [not null]
+
+  Note: "Immutable deployment configuration. Database/application constraints must reject changes after creation. IPv4 syntax, port range, endpoint allowlist, and fixed path are validated before readiness."
 }
 
-Enum artifact_kind {
-  command_output
-  parsed_vulnerability
-  http_transaction
-  file_sample
-  generic
-}
+Table execution_config_revisions {
+  id                    uuid [pk]
+  revision              integer [not null, unique]
+  worker_image_digest   text [not null]
+  fixture_image_digest  text [not null]
+  firewall_profile      text [not null]
+  resource_limits       jsonb [not null]
+  config_digest         text [not null, unique]
+  created_by            uuid [not null, ref: > operators.id]
+  created_at            timestamptz [not null]
 
-Enum coverage_dimension_kind {
-  port_range
-  subnet_range
-  vulnerability_class
-  tool_family
-}
-
-Enum probe_status {
-  pending
-  validated
-  dispatched
-  completed
-  failed
-  shed
-}
-
-Enum artifact_storage_kind {
-  inline
-  object_storage
-}
-
-Table scope_contracts {
-  id                     uuid [pk, default: `gen_random_uuid()`]
-  authorization_id       uuid [not null, unique]
-  name                   text [not null]
-  allowed_targets        jsonb [not null]
-  allowed_domains        jsonb [not null]
-  allowed_protocols      jsonb [not null]
-  allowed_tool_families  jsonb [not null]
-  disallowed_operations  jsonb [not null]
-  valid_from             timestamptz [not null]
-  valid_until            timestamptz [not null]
-  operator               text [not null]
-  created_at             timestamptz [not null, default: `now()`]
-
-  Indexes {
-    (authorization_id) [name: "idx_scope_contracts_authorization_id"]
-    (valid_until) [name: "idx_scope_contracts_valid_until"]
-  }
+  Note: "Immutable deployment configuration including pinned image digests, network/firewall profile identity, and bounded execution settings. A changed revision requires policy reevaluation."
 }
 
 Table runs {
-  id                uuid [pk, default: `gen_random_uuid()`]
-  authorization_id  uuid [not null, ref: > scope_contracts.authorization_id]
-  name              text [not null]
-  goal              text [not null]
-  status            run_status [not null, default: 'initiated']
-  started_at        timestamptz
-  completed_at      timestamptz
-  created_at        timestamptz [not null, default: `now()`]
-  updated_at        timestamptz [not null, default: `now()`]
-  version           integer [not null, default: 0]
+  id             uuid [pk]
+  created_by     uuid [not null, ref: > operators.id]
+  created_at     timestamptz [not null]
 
   Indexes {
-    (authorization_id, created_at) [name: "idx_runs_auth_created"]
-    (status, created_at) [name: "idx_runs_status_created"]
+    (id, created_by) [unique, name: "uniq_run_identity_owner"]
   }
+
+  Note: "Run identity is created before approval so legitimate pre-approval events do not need a fabricated authorization reference. Current run state belongs in events/projections, not a mutable authoritative status column."
+}
+
+Table scope_policies {
+  id                            uuid [pk]
+  run_id                        uuid [not null, ref: > runs.id]
+  revision                      integer [not null]
+  fixture_config_revision_id    uuid [not null, ref: > fixture_config_revisions.id]
+  execution_config_revision_id  uuid [not null, ref: > execution_config_revisions.id]
+  policy_document               jsonb [not null]
+  valid_from                    timestamptz [not null]
+  valid_until                   timestamptz [not null]
+  created_by                    uuid [not null, ref: > operators.id]
+  created_at                    timestamptz [not null]
+
+  Indexes {
+    (run_id, id) [unique, name: "uniq_policy_run_id"]
+    (run_id, revision) [unique, name: "uniq_policy_run_revision"]
+    (run_id, id, fixture_config_revision_id, execution_config_revision_id) [unique, name: "uniq_policy_approved_configuration"]
+  }
+
+  Note: "Immutable policy revision. Enforce valid_from < valid_until and prevent update/delete through database constraints/roles in the eventual migration."
+}
+
+Table probe_requests {
+  id                uuid [pk]
+  run_id            uuid [not null, ref: > runs.id]
+  schema_version    integer [not null]
+  fixture_key       text [not null]
+  method            text [not null, default: 'GET']
+  fixed_path        text [not null, default: '/']
+  normalized_request_data jsonb [not null]
+  request_digest    text [not null]
+  created_by        uuid [not null, ref: > operators.id]
+  created_at        timestamptz [not null]
+
+  Indexes {
+    (run_id, id) [unique, name: "uniq_request_run_id"]
+  }
+
+  Note: "Execution-relevant normalized request data is immutable; this is not an HTTP request body. Validation permits only the fixed M1 request shape; no caller headers, cookies, credentials, query, body, proxy, URL, or path override."
+}
+
+Table approvals {
+  id                  uuid [pk]
+  run_id              uuid [not null, ref: > runs.id]
+  request_id          uuid [not null]
+  policy_revision_id  uuid [not null]
+  fixture_config_revision_id    uuid [not null]
+  execution_config_revision_id  uuid [not null]
+  operator_id         uuid [not null, ref: > operators.id]
+  approved_at         timestamptz [not null]
+  resource_limits     jsonb [not null]
+
+  Indexes {
+    (run_id, id) [unique, name: "uniq_approval_run_id"]
+    (run_id, request_id, id) [unique, name: "uniq_approval_exact_request"]
+  }
+
+  Note: "The operator's explicit approval binds the exact request to the policy and both immutable configuration revisions, and to approved resource limits that must satisfy policy/configuration ceilings. It records asserted authorization, not proof of legal ownership; enforce the limit relationship transactionally."
+}
+
+Table policy_revocations {
+  id                  uuid [pk]
+  run_id              uuid [not null, ref: > runs.id]
+  policy_revision_id  uuid [not null]
+  operator_id         uuid [not null, ref: > operators.id]
+  reason_code         text [not null]
+  revoked_at          timestamptz [not null]
+
+  Indexes {
+    (run_id, policy_revision_id) [unique, name: "uniq_policy_revocation"]
+  }
+
+  Note: "Append-only revocation fact. Revocation is serialized against launch authorization using the transaction protocol in docs/m1-protocol.md."
+}
+
+Table execution_attempts {
+  id               uuid [pk]
+  run_id           uuid [not null, ref: > runs.id]
+  request_id       uuid [not null]
+  approval_id      uuid [not null]
+  attempt_number   integer [not null]
+  created_by       uuid [not null, ref: > operators.id]
+  created_at       timestamptz [not null]
+
+  Indexes {
+    (run_id, id) [unique, name: "uniq_attempt_run_id"]
+    (run_id, request_id, approval_id, id) [unique, name: "uniq_attempt_approval_binding"]
+    (run_id, attempt_number) [unique, name: "uniq_attempt_run_number"]
+  }
+
+  Note: "The composite approval reference must authorize this exact request, not merely share its run or digest. Authoritative lifecycle/outcome facts remain events. A manual retry is a separately approved request and a new attempt."
+}
+
+Table start_idempotency {
+  id                       uuid [pk]
+  operator_id              uuid [not null, ref: > operators.id]
+  operation                text [not null, default: 'start']
+  idempotency_key          text [not null]
+  normalized_request_data  jsonb [not null]
+  request_digest           text [not null]
+  outcome                  idempotency_outcome [not null]
+  run_id                   uuid [not null, ref: > runs.id]
+  request_id               uuid [not null]
+  approval_id              uuid
+  attempt_id               uuid
+  created_at               timestamptz [not null]
+
+  Indexes {
+    (operator_id, operation, idempotency_key) [unique, name: "uniq_idempotency_scope_key"]
+  }
+
+  Note: "Authenticate before lookup. Retain records for deployment lifetime; never silently expire/reuse a key. An accepted result references the mutually consistent request, approval, and attempt, and normalized_request_data equals the immutable request data; a busy result has null approval/attempt and no future work. Enforce outcome/nullability with a database CHECK, structured-data equality and policy-limit checks transactionally, and relationships with the declared composite references; DBML does not enforce these conditions."
+}
+
+Table broker_instances {
+  id              uuid [pk]
+  deployment_id   uuid [not null]
+  host_identity   text [not null]
+  started_at      timestamptz [not null]
+
+  Indexes {
+    (deployment_id, id) [unique, name: "uniq_broker_deployment_instance"]
+  }
+
+  Note: "Durable identity reference only. Exclusive live broker ownership comes from a protected OS service lock; database replay does not restore that lock or permit lease-timeout failover."
+}
+
+Table execution_claims {
+  attempt_id              uuid [pk, ref: > execution_attempts.id]
+  launch_progress         launch_progress [not null]
+  worker_presence         worker_presence [not null]
+  cancellation_status     cancellation_status [not null]
+  outcome_knowledge       execution_outcome_knowledge [not null]
+  broker_instance_id      uuid [ref: > broker_instances.id]
+  worker_identity         uuid [not null, unique]
+  container_id            text [unique]
+  create_start_started_at timestamptz
+  start_requested_at      timestamptz
+  observed_worker_started_at timestamptz
+  reserved_at             timestamptz [not null]
+  claimed_at              timestamptz
+  updated_at              timestamptz [not null]
+
+  Note: "Mutable live coordination state, not replay-derived authority. The broker owner is null while reserved and assigned once at claim. Keep launch progress, cancellation, worker presence, and attempt outcome knowledge separate; worker stop may coexist with unknown outcome. Outcome knowledge is synchronized with, but never replaces, authoritative attempt events. Only the owning broker incarnation advances a live claim. Persist worker identity before creation. Exact container ownership requires verified stored identity/labels and container ID; a name prefix alone is insufficient. Wall-clock timestamps are reporting data, not enforcement timers."
+}
+
+Table deployment_execution_slot {
+  slot_id             integer [pk]
+  state               execution_slot_state [not null]
+  active_attempt_id   uuid [unique, ref: > execution_attempts.id]
+  updated_at          timestamptz [not null]
+
+  Note: "Exactly one row with slot_id=1 is required. Enforce singleton, atomic row locking, enabled/recovery-disabled rules, and release only after confirmed worker stop and required cleanup in the migration/transaction implementation."
 }
 
 Table run_events {
-  id                bigint [pk, increment]
-  run_id            uuid [not null, ref: > runs.id]
-  event_index       bigint [not null]
-  kind              event_kind [not null]
-  schema_version    integer [not null, default: 1]
-  authorization_id  uuid [not null, ref: > scope_contracts.authorization_id]
-  occurred_at       timestamptz [not null, default: `now()`]
-  actor             text [not null]
-  payload_type      text [not null]
-  payload           jsonb [not null]
-  metadata          jsonb [not null, default: '{}']
-  payload_hash      text [not null]
+  id                    uuid [pk]
+  run_id                uuid [not null, ref: > runs.id]
+  event_sequence        bigint [not null]
+  schema_version        integer [not null]
+  kind                  event_kind [not null]
+  actor                  actor_kind [not null]
+  actor_operator_id     uuid [ref: > operators.id]
+  actor_reference       text [not null]
+  request_id            uuid
+  policy_revision_id    uuid
+  attempt_id            uuid
+  payload               jsonb [not null]
+  recorded_at           timestamptz [not null]
 
   Indexes {
-    (run_id, event_index) [unique, name: "uniq_run_event_index"]
-    (run_id, occurred_at) [name: "idx_run_events_run_occurred"]
-    (kind, occurred_at) [name: "idx_run_events_kind_occurred"]
-    (authorization_id, occurred_at) [name: "idx_run_events_auth_occurred"]
-    (occurred_at) [name: "idx_run_events_occurred_at"]
+    (run_id, event_sequence) [unique, name: "uniq_run_event_sequence"]
+    (run_id, id) [unique, name: "uniq_run_event_id"]
+    (run_id, recorded_at) [name: "idx_run_event_time"]
   }
 
-  Note: "Append-only source of truth. Never update or delete rows. Partition this table by occurred_at when volume grows. Keep event_index monotonic per run. payload is versioned JSON migrated on read."
+  Note: "Explicit schema version from first persisted event. Payload excludes artifact bytes. Events are immutable accepted facts; database roles/constraints must deny update/delete. Pre-approval events may have null policy/request/attempt references. Enforce actor-kind identity requirements and append next sequence under expected-revision transaction locking."
 }
 
-Table run_snapshots {
-  id                   uuid [pk, default: `gen_random_uuid()`]
-  run_id               uuid [not null, ref: > runs.id]
-  snapshot_event_index bigint [not null]
-  schema_version       integer [not null, default: 1]
-  state                jsonb [not null]
-  state_hash           text [not null]
-  created_at           timestamptz [not null, default: `now()`]
+Table run_projections {
+  run_id                 uuid [pk, ref: > runs.id]
+  last_event_sequence    bigint [not null]
+  projection_schema      integer [not null]
+  projection_data        jsonb [not null]
+  updated_at             timestamptz [not null]
 
-  Indexes {
-    (run_id, snapshot_event_index) [unique, name: "uniq_run_snapshot_index"]
-    (run_id, created_at) [name: "idx_run_snapshots_run_created"]
-    (created_at) [name: "idx_run_snapshots_created_at"]
-  }
-
-  Note: "Deterministic replay accelerator. Store latest known derived state plus integrity hash. Append-only; never rewrite old snapshots."
+  Note: "Rebuildable inspection projection. It is not authoritative and must not drive authorization, slot ownership, or live dispatch."
 }
 
-Table probes {
-  id                uuid [pk, default: `gen_random_uuid()`]
-  run_id            uuid [not null, ref: > runs.id]
-  probe_type        text [not null]
-  schema_version    integer [not null, default: 1]
-  target            text [not null]
-  protocol          text [not null]
-  tool_family       text [not null]
-  status            probe_status [not null, default: 'pending']
-  created_at        timestamptz [not null, default: `now()`]
-  updated_at        timestamptz [not null, default: `now()`]
+Table run_capture_accounting {
+  run_id             uuid [pk, ref: > runs.id]
+  capture_limit      bigint [not null]
+  reserved_bytes    bigint [not null]
+  retained_bytes    bigint [not null]
+  updated_at         timestamptz [not null]
 
-  Indexes {
-    (run_id, status) [name: "idx_probes_run_status"]
-    (run_id, probe_type) [name: "idx_probes_run_type"]
-    (run_id, created_at) [name: "idx_probes_run_created"]
-  }
-
-  Note: "Derived operational view for queued/active/completed probes. The executor still consumes typed validated probes from the app layer."
+  Note: "Serialize reservations and retained-byte updates transactionally. Staging bytes remain covered by reserved_bytes. On finalization transfer exact retained bytes from reservation to retained_bytes and release unused reservation; on abandoned staging cleanup release reservation. Enforce nonnegative values and reserved_bytes + retained_bytes within the configured aggregate cap in database constraints/transactions."
 }
 
 Table evidence_artifacts {
-  id                uuid [pk, default: `gen_random_uuid()`]
-  run_id            uuid [not null, ref: > runs.id]
-  source_event_id   bigint [not null, ref: > run_events.id]
-  probe_id          uuid [ref: > probes.id]
-  kind              artifact_kind [not null]
-  storage_kind      artifact_storage_kind [not null, default: 'object_storage']
-  tool_family       text [not null]
-  tool_version      text [not null]
-  content_type      text [not null]
-  storage_uri       text
-  content           bytea
-  size_bytes        bigint [not null]
-  truncated         boolean [not null, default: false]
-  captured_at       timestamptz [not null, default: `now()`]
-  content_hash      text [not null]
+  id                       uuid [pk]
+  run_id                   uuid [not null, ref: > runs.id]
+  attempt_id               uuid [not null]
+  lifecycle                artifact_lifecycle [not null]
+  capture_completeness     capture_completeness
+  capture_reason_code      capture_reason_code
+  max_retained_bytes       bigint [not null]
+  reserved_bytes           bigint [not null]
+  retained_bytes           bigint [not null]
+  content_type             text [not null]
+  response_metadata        jsonb [not null]
+  retained_digest          text
+  created_at               timestamptz [not null]
+  finalized_at             timestamptz
 
   Indexes {
-    (run_id, captured_at) [name: "idx_artifacts_run_captured"]
-    (source_event_id) [name: "idx_artifacts_source_event"]
-    (run_id, kind, captured_at) [name: "idx_artifacts_run_kind_captured"]
+    (run_id, id) [unique, name: "uniq_artifact_run_id"]
+    (run_id, attempt_id, id) [unique, name: "uniq_artifact_attempt_identity"]
+    (run_id, attempt_id) [name: "idx_artifact_attempt"]
   }
 
-  Note: "Prefer object storage for large payloads via storage_uri. Small artifacts may remain inline only when explicitly selected. Streaming ingestion should populate this table only after cap checks."
+  Note: "Application-level HTTP data only, not wire bytes. Lifecycle (staging/finalized) is separate from capture completeness (complete/incomplete); a finalized artifact may be incomplete. Staging has no finalized completeness value; finalized has exactly one, finalized_at is set, and reserved_bytes is zero. Response metadata is limited to bounded status, content type, and content-length. Finalized artifacts require exact retained byte count and digest, including the digest of empty bytes for a zero-byte complete response. Incomplete capture requires a bounded reason code; complete capture has none. Enforce valid combinations, reservation accounting, finalization, and immutability with database constraints/transactions; DBML notes do not enforce them."
 }
 
-Table findings {
-  id                uuid [pk, default: `gen_random_uuid()`]
-  run_id            uuid [not null, ref: > runs.id]
-  source_event_id   bigint [ref: > run_events.id]
-  probe_id          uuid [ref: > probes.id]
-  severity          text [not null]
-  status            finding_status [not null, default: 'pending']
-  title             text [not null]
-  description       text [not null]
-  evidence          jsonb [not null, default: '{}']
-  validated_by      text
-  validated_at      timestamptz
-  created_at        timestamptz [not null, default: `now()`]
-  updated_at        timestamptz [not null, default: `now()`]
+Table attempt_observations {
+  id              uuid [pk]
+  run_id          uuid [not null]
+  attempt_id      uuid [not null]
+  availability    observation_availability [not null]
+  reason_code     capture_reason_code
+  artifact_id     uuid
+  event_id        uuid [not null]
+  recorded_at     timestamptz [not null]
 
   Indexes {
-    (run_id, severity) [name: "idx_findings_run_severity"]
-    (run_id, status) [name: "idx_findings_run_status"]
-    (run_id, created_at) [name: "idx_findings_run_created"]
+    (run_id, id) [unique, name: "uniq_observation_run_id"]
+    (run_id, attempt_id) [unique, name: "uniq_attempt_observation"]
   }
 
-  Note: "Read model derived from events and validation workflow. Can reference synthesized findings without a probe_id."
+  Note: "Execution outcome remains an attempt fact and is not inferred from this observation. event_id references the accepted observation_recorded event. Unavailable requires a reason and no artifact; complete requires a finalized complete artifact and no reason; incomplete requires a reason and may reference a finalized incomplete artifact or no artifact when nothing was retained. A zero-byte complete response has a finalized artifact with zero retained bytes and the digest of empty bytes; it is not unavailable. Enforce cross-row state agreement and event-kind/linkage rules transactionally."
 }
 
-Table escalation_records {
-  id                uuid [pk, default: `gen_random_uuid()`]
-  run_id            uuid [not null, ref: > runs.id]
-  source_event_id   bigint [ref: > run_events.id]
-  state             escalation_state [not null]
-  reason            text [not null]
-  operator_id       text
-  authorization_id  uuid [not null, ref: > scope_contracts.authorization_id]
-  retry_count       integer [not null, default: 0]
-  next_retry_at     timestamptz
-  correlation_id    uuid [not null, default: `gen_random_uuid()`]
-  last_error        text
-  transitioned_at   timestamptz [not null, default: `now()`]
-  created_at        timestamptz [not null, default: `now()`]
-  updated_at        timestamptz [not null, default: `now()`]
+Table artifact_chunks {
+  run_id          uuid [not null]
+  artifact_id     uuid [not null]
+  chunk_number    integer [not null]
+  chunk_bytes     bytea [not null]
+  byte_count      integer [not null]
+  created_at      timestamptz [not null]
 
   Indexes {
-    (run_id, state) [name: "idx_escalations_run_state"]
-    (next_retry_at) [name: "idx_escalations_next_retry"]
-    (correlation_id) [name: "idx_escalations_correlation"]
-    (run_id, transitioned_at) [name: "idx_escalations_run_transitioned"]
+    (run_id, artifact_id, chunk_number) [pk, name: "pk_artifact_chunk_position"]
   }
 
-  Note: "Projection of the escalation state machine. The canonical transition history remains in run_events."
+  Note: "Bound chunk size at the production read/write boundary and verify byte_count equals octet_length(chunk_bytes). Finalized artifacts reject chunk insert/update/delete; cleanup of staging/orphan rows is bounded and audited."
 }
 
-Table coverage_map {
-  id                uuid [pk, default: `gen_random_uuid()`]
-  run_id            uuid [not null, ref: > runs.id]
-  target_component  text [not null]
-  attack_class      text [not null]
-  dimension_kind    coverage_dimension_kind [not null]
-  status            text [not null]
-  coverage_before   decimal [not null, default: 0]
-  coverage_after    decimal [not null, default: 0]
-  last_updated_at   timestamptz [not null, default: `now()`]
-  created_at        timestamptz [not null, default: `now()`]
+Table artifact_event_links {
+  run_id        uuid [not null]
+  artifact_id   uuid [not null]
+  event_id      uuid [not null]
+  link_kind     text [not null]
+  created_at    timestamptz [not null]
 
   Indexes {
-    (run_id, target_component, attack_class) [unique, name: "uniq_coverage_run_target_attack"]
-    (run_id, last_updated_at) [name: "idx_coverage_run_updated"]
+    (artifact_id) [pk, name: "pk_artifact_event_link"]
+    (run_id, event_id) [name: "idx_artifact_event_link_event"]
   }
+
+  Note: "For an artifact, link event_id to its accepted artifact_finalized event in the same transaction that writes the observation_recorded event/row and finalized metadata. An unfinished artifact has no finalized-evidence link."
 }
 
-Table artifact_links {
-  id                 uuid [pk, default: `gen_random_uuid()`]
-  artifact_id        uuid [not null, ref: > evidence_artifacts.id]
-  related_finding_id uuid [ref: > findings.id]
-  related_event_id   bigint [ref: > run_events.id]
-  relation_kind      text [not null]
-  created_at         timestamptz [not null, default: `now()`]
+Ref: approvals.(run_id, request_id) > probe_requests.(run_id, id)
+Ref: approvals.(run_id, policy_revision_id, fixture_config_revision_id, execution_config_revision_id) > scope_policies.(run_id, id, fixture_config_revision_id, execution_config_revision_id)
+Ref: policy_revocations.(run_id, policy_revision_id) > scope_policies.(run_id, id)
+Ref: execution_attempts.(run_id, request_id, approval_id) > approvals.(run_id, request_id, id)
+Ref: start_idempotency.(run_id, request_id) > probe_requests.(run_id, id)
+Ref: start_idempotency.(run_id, request_id, approval_id, attempt_id) > execution_attempts.(run_id, request_id, approval_id, id)
+Ref: run_events.(run_id, request_id) > probe_requests.(run_id, id)
+Ref: run_events.(run_id, policy_revision_id) > scope_policies.(run_id, id)
+Ref: run_events.(run_id, attempt_id) > execution_attempts.(run_id, id)
+Ref: evidence_artifacts.(run_id, attempt_id) > execution_attempts.(run_id, id)
+Ref: attempt_observations.(run_id, attempt_id) > execution_attempts.(run_id, id)
+Ref: attempt_observations.(run_id, attempt_id, artifact_id) > evidence_artifacts.(run_id, attempt_id, id)
+Ref: attempt_observations.(run_id, event_id) > run_events.(run_id, id)
+Ref: artifact_chunks.(run_id, artifact_id) > evidence_artifacts.(run_id, id)
+Ref: artifact_event_links.(run_id, artifact_id) > evidence_artifacts.(run_id, id)
+Ref: artifact_event_links.(run_id, event_id) > run_events.(run_id, id)
 
-  Indexes {
-    (artifact_id) [name: "idx_artifact_links_artifact"]
-    (related_finding_id) [name: "idx_artifact_links_finding"]
-    (related_event_id) [name: "idx_artifact_links_event"]
-  }
-}
+// Historical context: the prior proposal included findings, escalations,
+// coverage maps, snapshots, and object-storage options. Those structures are
+// not part of the active M1 model. Findings, escalations, coverage, recovery
+// snapshots, and object storage are deferred pending separate design review
+// and demonstrated need.
+//
+// DBML is descriptive. Its notes do not enforce append-only facts, immutable
+// configuration, singleton rows, state transitions, byte ceilings, approval/
+// request/attempt identity, outcome/nullability combinations, artifact
+// lifecycle/completeness combinations, actor checks, serialization, or
+// transactional finalization. The eventual PostgreSQL migration/application
+// must implement and test these constraints, privileges, locking order, and
+// failure semantics. No parser or SQL migration validation is claimed here.

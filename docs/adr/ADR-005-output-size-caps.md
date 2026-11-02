@@ -1,4 +1,4 @@
-# ADR-005: Output Size Caps
+# ADR-005: Bounded Artifact Capture and Output Limits
 
 **Status:** Accepted
 
@@ -6,148 +6,76 @@
 
 **Context:**
 
-Security tools can produce unbounded output:
-- Full packet captures (GB of data)
-- Large file dumps (vulnerability scanner output)
-- Verbose debug logs (exploit framework traces)
-
-Without caps, we risk:
-
-1. **Memory exhaustion**: Buffering large outputs in memory
-2. **Storage exhaustion**: Writing unbounded artifacts to disk
-3. **Event log bloat**: Embedding large artifacts in events
+Worker output can exhaust memory or storage if it is buffered or retained
+without limits. NEORAPTOR is a scaffold; this ADR records a design decision,
+not an implemented storage or crash-consistency guarantee.
 
 **Decision:**
 
-Enforce strict **size caps** on all sandbox output:
+Use configurable capture defaults of **10 MiB per artifact** and **100 MiB
+per run**, where 1 MiB is exactly 1,048,576 bytes. Enforce these limits while
+ingesting output. Configuration must remain within approved implementation
+and deployment ceilings; this ADR does not set numeric ceiling values.
 
-1. **Per-artifact cap**: 10 MB (configurable)
-2. **Per-run cap**: 100 MB (configurable)
-3. **Exceeded cap behavior**: Truncate content + emit `ArtifactTruncated` warning event
+The ingestion contract is:
 
-Caps are enforced during **streaming ingestion** (not buffering full output then checking size).
+1. Read bounded chunks into bounded intermediate buffers. Never buffer the
+   complete artifact in memory or accept unbounded chunks from a source.
+2. Reserve aggregate per-run capacity before capture. Account for retained
+   bytes exactly across concurrent ingestion and recovery.
+3. Write incrementally to controlled staging storage. Retain no bytes beyond
+   the configured artifact or run limit.
+4. Track exact retained-byte count and compute the content digest over the
+   retained bytes.
+5. Record explicit observation-completeness metadata, including whether the
+   capture completed normally or became incomplete and why.
+6. Finalize artifacts through a controlled storage operation and establish
+   the required event-to-artifact linkage. Finalization, crash consistency,
+   and recovery behavior remain persistence-design blockers.
+7. On storage failure, cancellation, or termination, perform bounded cleanup
+   and preserve known execution facts independently from capture completeness.
+   Do not claim that cleanup or a failure event can always be persisted.
+8. If the stream ends normally after exactly the configured limit, the
+   capture is not necessarily truncated. Exceedance is established only when
+   additional data is observed; that excess data is not retained. Bounded
+   reads may retain only the remaining permitted bytes from a bounded chunk,
+   then stop retention, mark the capture incomplete, initiate attempt
+   termination, and perform bounded stream cleanup. No unbounded lookahead is
+   required.
 
 **Consequences:**
 
 **Positive:**
-- **Bounded resource usage**: Memory and storage are protected
-- **Fast failure**: Caps are checked during streaming, not after full ingestion
-- **Visibility**: `ArtifactTruncated` events expose cap violations
-- **Operator override**: Caps are configurable per run (can raise for specific tools)
+- Retained artifact bytes and per-run aggregate capture can be bounded.
+- Completeness, exact retained size, and digest refer to the same captured
+  bytes.
+- Capture truncation does not erase or redefine known execution outcomes.
 
 **Negative:**
-- **Data loss**: Truncated artifacts may lose critical evidence
-- **Tool-specific tuning**: Some tools (e.g., full packet capture) require higher caps
-- **Streaming complexity**: Cap enforcement must happen during streaming, not buffering
+- A partial artifact may be insufficient for later interpretation.
+- Staging, finalization, event linkage, and crash recovery need a concrete
+  persistence design.
+- Per-run reservation must remain correct under concurrent ingestion.
 
-**Alternatives Considered:**
+**Deferred:**
 
-1. **No caps**: Simplest but risks resource exhaustion
-2. **Post-hoc truncation**: Buffer full output, then truncate → memory spike
-3. **Compression**: Compress artifacts before capping → adds CPU overhead, still needs a cap
+Numeric timeout/resource ceilings, staging-store selection, atomic
+finalization/linkage semantics, crash recovery, retention, and any policy for
+changing limits require the applicable design and deployment evidence.
 
-**Implementation Notes:**
+**Revision note:**
 
-**Streaming ingestion:**
-
-```rust
-impl Executor {
-    async fn ingest_with_cap(
-        &self,
-        mut stream: impl Stream<Item = Bytes>,
-        cap_bytes: u64,
-    ) -> Result<EvidenceArtifact, ProbeError> {
-        let mut buffer = Vec::new();
-        let mut total_bytes = 0;
-        let mut truncated = false;
-
-        while let Some(chunk) = stream.next().await {
-            if total_bytes + chunk.len() as u64 > cap_bytes {
-                // Cap exceeded: truncate and stop streaming
-                let remaining = (cap_bytes - total_bytes) as usize;
-                buffer.extend_from_slice(&chunk[..remaining]);
-                truncated = true;
-                break;
-            }
-            buffer.extend_from_slice(&chunk);
-            total_bytes += chunk.len() as u64;
-        }
-
-        if truncated {
-            emit_event(ArtifactTruncated { size_bytes: total_bytes, cap_bytes });
-        }
-
-        Ok(EvidenceArtifact {
-            content: buffer,
-            size_bytes: total_bytes,
-            truncated,
-        })
-    }
-}
-```
-**Memory efficiency improvements:**
-
-1. **Pre-allocation**: Use `Vec::with_capacity(cap_bytes)` (maximum buffer size in bytes) instead of `Vec::new()` to avoid growth reallocations during chunk ingestion  
-2. **Ref-counted storage**: Replace `content: Vec<u8>` with `content: Bytes` (from the `bytes` crate) to enable O(1) ref-counted cloning across actors without duplicating payloads (immutable, shared buffer)  
-3. **Event delegation**: Return `Result<IngestResult, _>` where `IngestResult` contains both the artifact and a `Vec<RunEvent>` of deferred events; the caller is responsible for emitting them, ensuring they are not dropped under event-store backpressure  
-
-**Updated implementation:**
-
-```rust
-use bytes::Bytes;
-
-struct IngestResult {
-    artifact: EvidenceArtifact,
-    deferred_events: Vec<RunEvent>, // Caller must emit these
-}
-
-// Replace line:
-// let mut buffer = Vec::new();
-// With:
-let mut buffer = Vec::with_capacity(cap_bytes);
-
-// Replace lines (emit_event call)
-// With:
-let mut deferred_events = Vec::new();
-if truncated {
-    deferred_events.push(RunEvent::ArtifactTruncated {
-        size_bytes: total_bytes,
-        cap_bytes,
-    });
-}
-
-// Replace return type and value:
-Ok(IngestResult {
-    artifact: EvidenceArtifact {
-        content: Bytes::from(buffer), // Single move into Bytes; no further copies, cheap clones after
-        size_bytes: total_bytes,
-        truncated,
-    },
-    deferred_events,
-})
-```
-
-**Rationale:**
-
-- Pre-allocation avoids growth reallocations when ingesting large streams (e.g., ~10 MB)  
-- `Bytes` provides immutable, shared storage with O(1) cloning across actors (e.g., analyzer, archiver)  
-- Returning deferred events ensures truncation signals are not dropped due to emitter backpressure; the caller controls emission and retry semantics
-
-**Configurable caps:**
-
-```rust
-let run_config = RunConfig {
-    artifact_cap_bytes: 10 * 1024 * 1024,  // 10 MB per artifact
-    run_cap_bytes: 100 * 1024 * 1024,      // 100 MB per run
-};
-```
-
-**Metrics:**
-- `neoraptor_artifacts_truncated_total` (counter)
-- `neoraptor_artifact_size_bytes` (histogram)
+This revision supersedes the earlier full-artifact `Vec` buffering,
+cap-sized preallocation, `Bytes`-based storage-safety claims, deferred-event
+return pattern, and claim that returning events ensures durability. The
+historical goal of streaming size enforcement is retained. No storage
+implementation or crash-consistency guarantee is implied.
 
 **References:**
 
-- [security.md](../security.md) — Output caps and sandbox guarantees
-- [domain-model.md](../domain-model.md) — EvidenceArtifact structure
-- [observability.md](../observability.md) — Artifact size metrics
+- [Security architecture](../security.md) — proposed worker and evidence
+  boundaries.
+- [Domain model](../domain-model.md) — artifact metadata and observation
+  completeness.
+- [Runtime architecture](../runtime.md) — cancellation and recovery.
+- [Testing strategy](../testing.md) — proposed verification requirements.
