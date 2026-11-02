@@ -52,6 +52,18 @@ impl FixtureKey {
                 actual_bytes: byte_length,
             });
         }
+        let bytes = value.as_bytes();
+        if !bytes[0].is_ascii_alphanumeric() {
+            return Err(RequestValidationError::InvalidFixtureKeyStart { byte: bytes[0] });
+        }
+        for (byte_index, byte) in bytes.iter().copied().enumerate().skip(1) {
+            if !byte.is_ascii_alphanumeric() && !matches!(byte, b'.' | b'_' | b'-') {
+                return Err(RequestValidationError::InvalidFixtureKeyCharacter {
+                    byte_index,
+                    byte,
+                });
+            }
+        }
         Ok(Self(value))
     }
 
@@ -64,6 +76,8 @@ impl FixtureKey {
 pub enum RequestValidationError {
     EmptyFixtureKey,
     FixtureKeyTooLong { actual_bytes: usize },
+    InvalidFixtureKeyStart { byte: u8 },
+    InvalidFixtureKeyCharacter { byte_index: usize, byte: u8 },
     UnsupportedSchemaVersion(u32),
     UnsupportedMethod,
     UnsupportedPath,
@@ -76,6 +90,14 @@ impl fmt::Display for RequestValidationError {
             Self::FixtureKeyTooLong { actual_bytes } => write!(
                 formatter,
                 "fixture key is {actual_bytes} UTF-8 bytes; maximum is {MAX_FIXTURE_KEY_BYTES}"
+            ),
+            Self::InvalidFixtureKeyStart { byte } => write!(
+                formatter,
+                "fixture key must start with an ASCII letter or digit; found byte 0x{byte:02X}"
+            ),
+            Self::InvalidFixtureKeyCharacter { byte_index, byte } => write!(
+                formatter,
+                "fixture key contains an invalid byte 0x{byte:02X} at byte index {byte_index}"
             ),
             Self::UnsupportedSchemaVersion(version) => {
                 write!(

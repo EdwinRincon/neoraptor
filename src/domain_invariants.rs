@@ -226,27 +226,128 @@ fn accepts_fixture_keys_at_one_and_128_utf8_bytes() {
         FixtureKey::try_new("x".repeat(128)).unwrap().as_str().len(),
         128
     );
+    assert_eq!(FixtureKey::try_new("aZ09._-").unwrap().as_str(), "aZ09._-");
+}
 
-    let multibyte = "é".repeat(64);
-    assert_eq!(
-        FixtureKey::try_new(multibyte.as_str()).unwrap().as_str(),
-        multibyte
-    );
+#[test]
+fn accepts_fixture_keys_through_request_and_configuration_constructors() {
+    let accepted_keys = ["x".to_owned(), "x".repeat(128), "aZ09._-".to_owned()];
+
+    for key in &accepted_keys {
+        let request = ProbeRequest::try_new(id(1), id(2), 1, key.as_str(), "GET", "/").unwrap();
+        let fixture_config = FixtureConfigRevision::try_new(id(3), key.as_str()).unwrap();
+
+        assert_eq!(request.data().fixture_key().as_str(), key);
+        assert_eq!(fixture_config.fixture_key().as_str(), key);
+    }
 }
 
 #[test]
 fn rejects_empty_and_overlong_fixture_keys_by_utf8_byte_length() {
-    assert_eq!(
-        FixtureKey::try_new(""),
-        Err(RequestValidationError::EmptyFixtureKey)
-    );
-    assert_eq!(
-        FixtureKey::try_new("x".repeat(129)),
-        Err(RequestValidationError::FixtureKeyTooLong { actual_bytes: 129 })
+    assert_fixture_key_rejected_by_all_constructors("", RequestValidationError::EmptyFixtureKey);
+    assert_fixture_key_rejected_by_all_constructors(
+        &"x".repeat(129),
+        RequestValidationError::FixtureKeyTooLong { actual_bytes: 129 },
     );
     assert_eq!(
         FixtureKey::try_new("é".repeat(65)),
         Err(RequestValidationError::FixtureKeyTooLong { actual_bytes: 130 })
+    );
+}
+
+#[test]
+fn rejects_fixture_keys_outside_ascii_syntax() {
+    let invalid_keys = [
+        (
+            " leading",
+            RequestValidationError::InvalidFixtureKeyStart { byte: b' ' },
+        ),
+        (
+            "trailing ",
+            RequestValidationError::InvalidFixtureKeyCharacter {
+                byte_index: 8,
+                byte: b' ',
+            },
+        ),
+        (
+            "in ternal",
+            RequestValidationError::InvalidFixtureKeyCharacter {
+                byte_index: 2,
+                byte: b' ',
+            },
+        ),
+        (
+            "é",
+            RequestValidationError::InvalidFixtureKeyStart { byte: 0xC3 },
+        ),
+        (
+            "😀",
+            RequestValidationError::InvalidFixtureKeyStart { byte: 0xF0 },
+        ),
+        (
+            "a/b",
+            RequestValidationError::InvalidFixtureKeyCharacter {
+                byte_index: 1,
+                byte: b'/',
+            },
+        ),
+        (
+            "a:b",
+            RequestValidationError::InvalidFixtureKeyCharacter {
+                byte_index: 1,
+                byte: b':',
+            },
+        ),
+        (
+            ".fixture",
+            RequestValidationError::InvalidFixtureKeyStart { byte: b'.' },
+        ),
+        (
+            "_fixture",
+            RequestValidationError::InvalidFixtureKeyStart { byte: b'_' },
+        ),
+        (
+            "-fixture",
+            RequestValidationError::InvalidFixtureKeyStart { byte: b'-' },
+        ),
+    ];
+
+    for (key, expected_error) in invalid_keys {
+        assert_fixture_key_rejected_by_all_constructors(key, expected_error);
+    }
+}
+
+#[test]
+fn fixture_key_binding_remains_case_sensitive_and_exact() {
+    let fixture = fixture();
+    let differently_cased_request =
+        ProbeRequest::try_new(id(8), id(1), 1, "Local-Fixture", "GET", "/").unwrap();
+
+    assert_eq!(
+        ApprovalBinding::try_new(
+            id(9),
+            &differently_cased_request,
+            &fixture.policy,
+            &fixture.fixture_config,
+            &fixture.execution_config,
+            *fixture.approval.resource_limits(),
+        ),
+        Err(ApprovalBindingError::FixtureKeyMismatch)
+    );
+}
+
+fn assert_fixture_key_rejected_by_all_constructors(
+    key: &str,
+    expected_error: RequestValidationError,
+) {
+    assert_eq!(FixtureKey::try_new(key), Err(expected_error));
+    assert_eq!(
+        ProbeRequest::try_new(id(1), id(2), 1, key, "GET", "/"),
+        Err(expected_error)
+    );
+    assert_eq!(
+        FixtureConfigRevision::try_new(id(3), key),
+        Err(expected_error)
     );
 }
 

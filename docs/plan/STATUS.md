@@ -26,16 +26,17 @@ are recorded below. This is not implementation authorization.
   implementation exists.
 - ADR-008 is accepted. The canonical domain, protocol, and descriptive schema
   now specify the 1–128-byte ASCII fixture-key rule and exact normalized
-  request-value comparison without request digests. The Rust
-  `FixtureKey::try_new` implementation and its tests still accept non-empty
-  valid UTF-8 up to 128 bytes and do not enforce the accepted ASCII
-  character set. The schema no longer includes request-digest fields; artifact
-  and image digest semantics are unchanged. No persistence implementation
-  exists.
+  request-value comparison without request digests. Rust
+  `FixtureKey::try_new` now enforces the accepted ASCII syntax for both request
+  and fixture-configuration constructors. Deterministic unit tests for the
+  syntax, byte limits, constructor consistency, and exact case-sensitive
+  binding pass in the workspace suite (35 tests). The schema no longer includes
+  request-digest fields; artifact and image digest semantics are unchanged. No
+  persistence implementation exists.
 - ADR-008's body and the ADR index now consistently identify it as accepted.
   ADR-002, ADR-004, architecture, and testing wording has been reconciled with
-  the no-request-digest decision. The accepted ASCII fixture-key rule remains
-  unimplemented in Rust.
+  the no-request-digest decision. The accepted ASCII fixture-key implementation
+  and its unexecuted tests are described below.
 - `rust-toolchain.toml` pins Rust `1.95.0`.
 - `docs/product.md` records unvalidated customer and differentiation
   hypotheses, future product directions, and customer-outcome measures.
@@ -59,10 +60,12 @@ are recorded below. This is not implementation authorization.
 The pure domain slice validates the fixed request shape, half-open policy
 validity, exact run/request/policy/configuration/approval bindings, and
 approved resource limits against policy and execution-configuration ceilings.
-The current fixture-key constructor enforces non-empty UTF-8 and the 128-byte
-maximum, but not ADR-008's accepted ASCII syntax; existing unit tests confirm
-that a 128-byte multibyte key is accepted. The request comparison, outcome
-event mapping, and schema changes in ADR-008 are documentation decisions only.
+The fixture-key constructor enforces ADR-008's ASCII syntax and byte bound,
+and applies it through both `ProbeRequest` and `FixtureConfigRevision`.
+Deterministic tests cover accepted/rejected syntax, UTF-8 byte boundaries,
+both constructors, and case-sensitive fixture binding; all 35 workspace tests
+pass. Request comparison and outcome-event mapping remain documentation
+decisions only.
 Authorization inputs and approval resource limits are required by the Rust
 types. Attempt binding has its own error type. `CheckObservation` directly
 represents observed HTTP status; outcome and observation remain independent.
@@ -76,7 +79,7 @@ and have no persistence conversion.
 
 | Gate | State | Evidence or blocker |
 |---|---|---|
-| A. Domain/storage implementation readiness | Partial pure-domain slice implemented and unit tested; gate remains open. | ADR-008 is accepted and its documentation decisions are reflected in the canonical contracts. Review and test the pure-domain ASCII key rule separately before API/persistence exposure. Persistence, artifact lifecycle/accounting, event ordering, event/outcome consistency, idempotency, and their tests remain unimplemented. |
+| A. Domain/storage implementation readiness | Partial pure-domain slice implemented and unit tested; gate remains open. | ADR-008 is accepted and its documentation decisions are reflected in the canonical contracts. ASCII key validation and deterministic tests are implemented; test execution remains pending before API/persistence exposure. Persistence, artifact lifecycle/accounting, event ordering, event/outcome consistency, idempotency, and their tests remain unimplemented. |
 | B. Broker/network implementation readiness | Blocked. | Review and validate the supported host/kernel/Docker/firewall compatibility target, broker privilege/identity boundary, concrete network enforcement specification, ownership/reconciliation, and cancellation/deadline behavior. |
 | C. Controlled fixture execution readiness | Blocked. | Requires relevant broker/network and storage safeguards implemented and inspected on the selected host, with representative negative reachability and recovery/cleanup evidence. A finished SvelteKit UI is not required; an authenticated integration-test client may exercise the backend. |
 | D. Full M1 acceptance | Blocked. | Requires reviewed backend, evidence, failure/recovery, network, and frontend acceptance evidence. No M1 acceptance tests have run. |
@@ -102,7 +105,7 @@ without granting current execution permissions.
 ## Validation evidence and scope
 
 Validation for the current pure-domain slice: `cargo fmt --all -- --check`,
-`cargo test --workspace` (32 tests passed), and
+`cargo test --workspace` (35 tests passed), and
 `cargo clippy --all-targets --all-features -- -D warnings` passed.
 `cargo run --quiet` still prints `Hello, world!`; `git diff --check` passed.
 No controlled fixture test, security verification, live deployment, SQL
@@ -110,18 +113,17 @@ migration, or persistence behavior is claimed. Earlier structural checking
 found no missing DBML reference columns or non-unique reference targets across
 20 tables; this is not DBML parser validation. Workflow configuration was not
 inspected; configured CI checks and their results remain pending verification.
-For this documentation task, `git diff --check` passed. No builds, tests,
-DBML parser, migration, persistence, security, or operational checks were run.
+For the ADR-008 documentation reconciliation, only `git diff --check` was run.
+The fixture-key task did not run DBML parsing, migrations, persistence,
+security, or operational checks.
 
 ## Next eligible task
 
-Implement ADR-008's accepted ASCII fixture-key rule in `FixtureKey::try_new`
-and add deterministic domain tests under the separate bounded authorization.
-Do not begin persistence or execution work. M0 review still needs independent
-protocol/schema review, event ordering, artifact lifecycle/accounting,
-admission/idempotency transaction rules, and their proposed tests. Other M0
-gates include authentication/credential and database-role/durability details,
-broker ownership/reconciliation, host/network compatibility, deployment
-ceilings, and frontend contract review. Broker/network work, controlled
-fixture execution, and full M1 acceptance remain separately gated. M0 remains
-incomplete until its recorded exit criteria are satisfied.
+Continue M0 closure with independent protocol/schema review and review of event
+ordering, artifact lifecycle/accounting, admission/idempotency transaction
+rules, and their proposed tests. Other M0 gates include authentication/
+credential and database-role/durability details, broker ownership/
+reconciliation, host/network compatibility, deployment ceilings, and frontend
+contract review. Do not begin persistence, broker/network, or execution work.
+Controlled fixture execution and full M1 acceptance remain separately gated.
+M0 remains incomplete until its recorded exit criteria are satisfied.
