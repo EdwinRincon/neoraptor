@@ -31,32 +31,34 @@
   decisions; ADR-007 is deferred outside M1. See the [ADR decision
   map](../adr/README.md).
 - The M1 protocol and DBML schema are design proposals; DBML notes do not
-  enforce behavior. ADR-009 closes event append at the design level, but
-  persistence, migrations, database enforcement, concurrency tests, and
-  operational verification are unimplemented.
+  enforce behavior. ADR-009 closes event append at the design level. ADR-011
+  remains Proposed; its admission/idempotency rules and required
+  concurrency/crash/replay cases are design proposals, not implemented tests.
+  Persistence, migrations, database enforcement, and operational verification
+  remain unimplemented.
 - Exact request equality and outcome-event mapping are design-only. ADR-010
   accepts artifact lifecycle/accounting design closure as documented in the
   M1 protocol; persistence, migrations, database enforcement, proposed tests,
-  and operational verification remain unimplemented. Admission/idempotency
-  transactions, recovery implementation, broker/network controls, and
-  frontend behavior remain design-only or incomplete.
+  and operational verification remain unimplemented. Recovery implementation,
+  broker/network controls, and frontend behavior remain design-only or
+  incomplete.
 - Snapshots and recursive event-schema migration machinery are deferred.
 
 ## Open gates
 
 | Gate | State | Remaining work |
 |---|---|---|
-| M0 design baseline | In progress | Independent protocol/schema disposition; admission/idempotency rules; remaining authentication, database durability/roles, broker/recovery, deployment, budget, and frontend review. |
-| Domain/storage implementation | Partial; open | ADR-010 accepts artifact lifecycle/accounting design closure. Close admission/idempotency transaction rules; review constraints/roles and host durability assumptions. Persistence, migrations, database enforcement, tests, and operational verification remain unimplemented. Any implementation needs separate authorization. |
+| M0 design baseline | In progress | Review the proposed ADR-011 contract; complete independent protocol/schema disposition and M0 exit review; resolve remaining authentication, database durability/roles, broker/recovery, deployment, budget, and frontend review. |
+| Domain/storage implementation | Partial; open | ADR-010 accepts artifact lifecycle/accounting design closure. ADR-011 proposes admission/idempotency rules and test specifications; review/acceptance, constraints/roles, and host durability assumptions remain. Persistence, migrations, database enforcement, tests, and operational verification remain unimplemented. Any implementation needs separate authorization. |
 | Broker/network implementation | Blocked | Resolve broker ownership/reconciliation and service boundary; review host/kernel/Docker/firewall compatibility and concrete egress controls. |
 | Controlled fixture execution | Blocked | Requires implemented and inspected storage, broker, network, recovery, and cleanup safeguards plus controlled evidence. |
 | Full M1 acceptance | Blocked | Requires end-to-end backend, evidence, failure/recovery, network, and frontend acceptance evidence. |
 
 ## Next eligible task
 
-Close admission/idempotency transaction rules as the next design-only task.
-Persistence, migrations, database enforcement, tests, and operational
-verification remain unimplemented; the domain/storage readiness gate remains
-open. M0 remains in progress. Then complete independent protocol/schema
-disposition and the M0 exit review. Do not start persistence, broker/network,
-fixture execution, or frontend implementation.
+Complete independent protocol/schema disposition, including review of
+proposed ADR-011, then conduct the M0 exit review. Persistence, migrations,
+database enforcement, tests, and operational verification remain
+unimplemented; the domain/storage readiness gate remains open. M0 remains in
+progress. Do not start persistence, broker/network, fixture execution, or
+frontend implementation.

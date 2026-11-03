@@ -300,17 +300,69 @@ forbidden. The caller may retry with a new expected revision or surface the
 structured conflict. Reusing an event UUID with different content is a
 permanent conflict. Append retries never trigger a target-facing action.
 
-For admission, lock the singleton slot before touching the idempotency key.
-An absent-row `SELECT` does not reserve a key. Attempt a unique-constraint
-insert with conflict-safe semantics; if another transaction owns the key,
-wait for its result, reread and lock the committed row, then compare every
-field of the complete normalized request value. Return its original result
-for an exact match or a conflict for any mismatch. A mismatch fails closed:
-do not create another attempt or dispatch.
-Admission transactionally writes either a stable busy result with no approval
-or attempt, or the accepted approval/request/attempt binding, slot
-reservation, durable intent, and accepted idempotency result. Commit before
-sending the separate live broker command.
+#### Admission and start idempotency
+
+Authenticate before key lookup and structurally validate the request. Compare
+the complete normalized typed value (`schema_version`, `fixture_key`,
+`method`, and `fixed_path`) exactly; do not hash it or compare a digest.
+Idempotency scope is `(operator_id, operation, idempotency_key)`. Retain the
+complete normalized value and final result for the deployment lifetime; do
+not silently expire or reuse a key.
+
+Lock the singleton execution-slot row first, then resolve an existing scoped key. An absent-row `SELECT` is not a reservation. The unique scoped-key constraint arbitrates concurrent first use in the same transaction that commits the final result. If another transaction wins, resolve its committed record and compare the complete normalized request: return the original result for an exact match or `Conflict` for a mismatch. If the result cannot be established or is inconsistent, fail closed.
+
+For a new key, verify the existing run, request, exact approval, current
+policy/revocation, referenced immutable configuration, and capture accounting
+under the stated lock order. If the slot is occupied or `recovery_disabled`,
+persist `Busy`; otherwise, if no run capture budget remains, persist
+`Rejected(capture_budget_exhausted)`; otherwise persist `Accepted`. `Busy`
+takes precedence when both conditions apply. Missing, ambiguous, inconsistent,
+expired, revoked, or unverifiable authorization, budget, or slot state never
+becomes `Accepted`; fail closed without dispatch. Do not invent a durable
+result for an indeterminate prerequisite.
+
+Commit the final idempotency result and its outcome-specific writes in one
+transaction; any failure before commit rolls back the admission result and
+dependent writes:
+
+- `Accepted` atomically binds the exact request and approval, creates the
+  attempt and reserved claim, reserves the slot, appends the durable dispatch
+  intent, and stores the accepted key result.
+- `Busy` stores the stable result with null approval, attempt, and rejection
+  code and appends the existing `start_busy` event in the same transaction. It
+  creates no attempt, slot reservation, dispatch, or queued work.
+- `Rejected(capture_budget_exhausted)` stores `outcome = rejected` and the
+  structured rejection code with null approval and attempt. It creates no
+  attempt, slot reservation, dispatch, artifact, observation, or new run, and
+  appends no run event. A pre-existing run/request remains unchanged.
+
+Only the accepted branch dispatches, and only after its durable commit. An
+`Accepted` result records committed admission; it is not continuing execution
+permission and does not replace the broker's final permission check. Busy and
+rejected records are durable admission results, not future-work instructions.
+A retry of the same key and exact request returns that result even if the slot
+or budget later changes; a new attempt requires a separately authorized
+request identity and a new key.
+
+Return `Accepted`, `Busy`, or `Rejected(capture_budget_exhausted)` only after
+commit acknowledgement. A same-key normalized-value mismatch is `Conflict`.
+If commit acknowledgement is lost, return `Indeterminate` while the outcome
+cannot be resolved. Resolve it by looking up or retrying with the original
+key and exact normalized request against authoritative state. If found, return
+the stored result and do not create another attempt, event, or dispatch. If
+absent and no related admission state exists, the same-key request may run
+through the normal transaction again. If records disagree or the outcome
+remains ambiguous, fail closed and keep execution disabled; never retry with
+a new key or blindly repeat dispatch. A key-based retry itself never dispatches.
+
+At restart, accepted, busy, and rejected records remain authoritative
+coordination state. Reconcile any accepted attempt/slot through the existing
+startup recovery rules before enabling execution. Busy and rejected retries
+return their stored results and do not become eligible later. Replay rebuilds
+projections only; it cannot create or change idempotency records, authorize
+execution, recreate slot ownership, or launch workers. No isolation level,
+PostgreSQL major version, or general database transaction-retry policy is
+selected here.
 
 See the schema and invariants in [schema.dbml](../crates/db/schema.dbml);
 DBML notes describe required behavior but do not enforce it. Database
@@ -327,8 +379,8 @@ request:
 |---|---|
 | Same key, same normalized request | Return the original stored result/reference. |
 | Same key, different normalized request | Return conflict; do not modify the original record. |
-| New key while slot is occupied or recovery-disabled | Persist and return `busy`; create no attempt or queued work. |
-| New request with no remaining run capture budget | Return explicit admission failure `capture_budget_exhausted`; create no attempt, reserve no execution slot, dispatch no worker, and create no artifact or observation. This is not a capture reason or execution outcome. Durable idempotency/retry handling for this rejection remains part of admission/idempotency design closure. |
+| New key while slot is occupied or recovery-disabled | Persist and return `Busy`; create no attempt or queued work. This takes precedence over budget exhaustion. |
+| New key with available slot and no remaining run capture budget | Persist and return `Rejected(capture_budget_exhausted)`; create no attempt, reserve no execution slot, dispatch no worker, create no artifact or observation, and append no run event. This is not a capture reason or execution outcome. |
 | New key with slot available | Atomically accept request, attempt, intent, idempotency result, and slot reservation before live dispatch. |
 
 Retain idempotency keys, complete normalized request values, and results for
@@ -344,13 +396,14 @@ same request as its approval. Approval resource limits must satisfy the
 referenced policy and execution-configuration ceilings. An accepted
 idempotency result must reference that mutually consistent request, approval,
 and attempt, and its complete normalized request data must exactly equal the
-referenced immutable request data. A busy result must have no approval or
-attempt and cannot create future work. Enforce these relationships with
-composite unique keys/foreign keys where available and database
-CHECK/transaction enforcement for conditional nullability and structured-data
-equality. Exact normalized-value equality or run-ID equality alone is
-insufficient to establish exact approval; the declared request/approval
-relationships are required.
+referenced immutable request data; it has no rejection code. Busy and rejected
+results have null approval/attempt; busy has no rejection code, while rejected
+has a structured rejection code (`capture_budget_exhausted` for M1). Enforce
+these relationships with composite unique keys/foreign keys where available
+and database CHECK/transaction enforcement for conditional nullability and
+structured-data equality. Exact normalized-value equality or run-ID equality
+alone is insufficient to establish exact approval; the declared
+request/approval relationships are required.
 
 There is one broker instance per dedicated host, protected by an exclusive
 OS-level service lock and protected deployment/instance identifiers. No
@@ -435,9 +488,9 @@ call.
 
 | Operation | Required prior state | Required owner | Rows locked | Durable changes | Duplicate command result | Failure/recovery |
 |---|---|---|---|---|---|---|
-| Admission and slot reservation | Slot enabled and empty; exact request has a valid approval, or request is rejected before admission | Authenticated control service | Slot; idempotency key; request/approval/policy/config; new attempt/claim; event sequence | Persist stable busy with null approval/attempt, or accepted attempt, reserved slot, reserved claim, intent event, and accepted key result atomically | Same key/same normalized request returns stored result; changed request conflicts; distinct key while occupied returns busy without queued work | Lost commit acknowledgement is resolved by original key and slot query before any resubmission; never invent future work |
+| Admission and slot reservation | Authenticated, structurally valid new start request | Authenticated control service | Slot, scoped key, and state rows required by the canonical lock order | Commit one final idempotency result and its outcome-specific writes as specified under Admission and start idempotency | Exact same-key request returns the stored result; mismatch conflicts | Resolve ambiguity by original key; never blindly repeat dispatch; fail closed if unresolved |
 | Broker claim | Reserved attempt and claim; slot points to attempt; broker owns exclusive host lock | One live broker incarnation; it assigns itself as claim owner once | Slot; policy/request/approval as needed; attempt; claim; event sequence | Set owner incarnation and claimed progress; append claim fact | Same owner returns current claim; different owner is rejected; no second claim/launch | Owner mismatch or unresolved prior broker keeps dispatch disabled; no lease takeover |
-| Launch authorization | Claimed, not cancelled, no create/start request; final permission still valid | Recorded owning broker incarnation | Slot; request/approval/policy/revocation/config; attempt; claim; event sequence | Commit authoritative final check and launch-authorized fact | Return recorded authorization/denial; never repeat the check as a fresh launch | Denial prevents create; authorization commit ambiguity is queried before proceeding |
+| Launch authorization | Claimed, not cancelled, no create/start request; final permission still valid | Recorded owning broker incarnation | Slot; request/approval/policy/revocation/config; attempt; claim; event sequence | Commit authoritative final check and launch-authorized fact | Return the recorded result for this launch-authorization operation; it does not authorize a new launch | Denial prevents create; authorization commit ambiguity is queried before proceeding |
 | Policy revocation | Policy revision exists; revocation not already committed | Authenticated operator/control service | Slot; policy/revocation; active attempt/claim if any; event sequence | Append revocation fact; if launch authorization already committed, request cancellation independently | Existing revocation returns its recorded result; conflicting reason/payload does not overwrite it | Lock order serializes against final authorization; persistence failure blocks further dispatch and triggers bounded cancellation where possible |
 | Container creation | Launch authorized; cancellation not requested | Recorded owning broker incarnation | Slot; attempt; claim; event sequence | First commit `create_requested`; then call Docker outside transaction; on confirmed success record exact container ID and created state | If already requested/created, inspect persisted worker identity and return current state; never blindly create again | Timeout/error is ambiguous; inspect owned resources. If absence cannot be established, mark presence unknown and keep slot |
 | Container start | Container creation confirmed; cancellation not requested | Recorded owning broker incarnation | Slot; attempt; claim; event sequence | Immediately before the Docker start call, establish monotonic operation/execution deadlines; commit start-requested and wall-clock report timestamp; call Docker outside transaction; record confirmed result if returned | If start already requested/started, inspect; do not issue another start | Delayed/lost acknowledgement or timeout is ambiguous; timer continues, inspect and cancel/reconcile; no unconditional repeat |
@@ -688,11 +741,9 @@ cannot be established.
 
 | Failure point | Known durable facts | Possible target effects | Recovery action | New execution permitted? |
 |---|---|---|---|---|
-| Concurrent duplicate start; same key and request | Original idempotency result and operation | Only effects from the original operation | Return original reference; do not dispatch again | Only if normal slot/readiness checks permit a distinct request |
-| Same key, changed request | Original key, complete normalized request value, and result | No new effect from the conflicting request | Reject any normalized-value mismatch; preserve the original record | No new attempt from that key |
-| Distinct start while busy | Stable `busy` idempotency result; no attempt | Existing worker only | Return busy; caller may later submit a separately approved request with a new key | After slot release and readiness |
 | Failure before intent commit | No accepted intent; transaction is rolled back or outcome is queried by key | None from this attempt | Query original idempotency key; never blindly resubmit with a new key | After reconciliation confirms no accepted operation |
-| Commit acknowledgement lost | Commit may or may not have succeeded | None until live dispatch; after successful commit, dispatch may follow | Query by original key and inspect slot/attempt before further action | Only after durable state is resolved |
+| Commit acknowledgement lost | Commit may or may not have succeeded | No target effect may be inferred from the acknowledgement; dispatch is separate and post-commit | Retry/lookup by original key and exact request; return the stored result if present; never dispatch from the retry; unresolved or inconsistent state stays disabled | Only after durable state and normal readiness are resolved |
+| Restart with accepted, busy, or rejected result | Admission result remains durable; accepted attempt/slot state may require reconciliation | Existing accepted attempt only; busy/rejected admission has no target effect | Return stored result for exact same-key retry; reconcile accepted live state before enabling execution; replay changes no admission history | No until accepted state is reconciled and normal readiness passes |
 | Duplicate broker command | Existing durable claim/attempt state | Existing launch only | Return/inspect existing claim; do not repeat create/start | No additional attempt while occupied |
 | Final-check denial | Denial and claim/attempt facts if persisted | No launch if denial precedes container start | Release slot only after broker confirms no worker exists and cleanup is complete | Yes after durable cleanup and policy/config correction |
 | Crash before container creation | Intent/claim/launch authorization may exist | No worker if absence is established | Inspect broker ownership and Docker inventory; record known launch failure or unknown if uncertain | Only after ownership and cleanup reconciliation |

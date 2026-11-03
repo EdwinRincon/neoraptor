@@ -13,6 +13,11 @@ Enum actor_kind {
 Enum idempotency_outcome {
   accepted
   busy
+  rejected
+}
+
+Enum idempotency_rejection_code {
+  capture_budget_exhausted
 }
 
 Enum execution_slot_state {
@@ -259,6 +264,7 @@ Table start_idempotency {
   idempotency_key          text [not null]
   normalized_request_data  jsonb [not null]
   outcome                  idempotency_outcome [not null]
+  rejection_code           idempotency_rejection_code
   run_id                   uuid [not null, ref: > runs.id]
   request_id               uuid [not null]
   approval_id              uuid
@@ -269,7 +275,7 @@ Table start_idempotency {
     (operator_id, operation, idempotency_key) [unique, name: "uniq_idempotency_scope_key"]
   }
 
-  Note: "Authenticate before lookup. Retain the complete normalized request value and result for deployment lifetime; M1 uses exact normalized-value equality and has no request digest. Never silently expire/reuse a key. An accepted result references the mutually consistent request, approval, and attempt, and normalized_request_data exactly equals the immutable request data; any mismatch conflicts and fails closed. A busy result has null approval/attempt and no future work. Enforce outcome/nullability with a database CHECK, structured-data equality and policy-limit checks transactionally, and relationships with the declared composite references; DBML does not enforce these conditions."
+  Note: "Authenticate before lookup. Retain the scoped key, complete normalized request value, and final result without silent expiry or reuse; no request digest is used. normalized_request_data must equal the referenced immutable request data. Accepted requires null rejection_code and non-null approval_id/attempt_id; busy requires null rejection_code/approval_id/attempt_id; rejected requires non-null rejection_code and null approval_id/attempt_id. Enforce these conditions and relationships with database constraints/transactions; DBML does not enforce them."
 }
 
 Table broker_instances {
